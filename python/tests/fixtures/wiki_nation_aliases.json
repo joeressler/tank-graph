@@ -1,0 +1,13 @@
+{
+  "USSR": ["USSR", "Soviet Union", "Russian"],
+  "Germany": ["Germany", "German"],
+  "USA": ["USA", "United States", "American"],
+  "France": ["France", "French"],
+  "UK": ["UK", "United Kingdom", "British"],
+  "China": ["China", "Chinese", "PRC"],
+  "Japan": ["Japan", "Japanese"],
+  "Czechoslovakia": ["Czechoslovakia", "Czechoslovak", "Czech"],
+  "Sweden": ["Sweden", "Swedish"],
+  "Poland": ["Poland", "Polish"],
+  "Italy": ["Italy", "Italian"]
+}

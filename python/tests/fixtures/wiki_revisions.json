@@ -1,0 +1,53 @@
+{
+  "legacy": {
+    "query": {
+      "pages": {
+        "1": {
+          "pageid": 1,
+          "title": "Tank:Tiger I",
+          "pageprops": {"displaytitle": "<span>Tiger I</span>"},
+          "revisions": [
+            {
+              "*": "{{ Vehicle\n| TYPE = [[Heavy tank]]\n| country = German\n| level = 7\n}}\n== Performance ==\n<!-- hidden -->It excels at [[Sniping|long-range sniping]].<ref>citation</ref>\n* Use [[Hull-down]] cover. {{cite web|x}}\n[[File:Tiger.png|thumb|image]]\n{| class=\"wikitable\"\n| hidden table\n|}\n=== Details ===\nKeep nested advice.\n== History ==\nDo not include history."
+            }
+          ]
+        }
+      }
+    }
+  },
+  "modern": {
+    "query": {
+      "pages": [
+        {
+          "pageid": 2,
+          "title": "Tank:Modern",
+          "revisions": [
+            {
+              "slots": {
+                "main": {
+                  "content": "{{tank_data|id=Modern_1|name=Modern|class=medium tanks|nation=USA|tier=5}}"
+                }
+              }
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "tankdata_live": {
+    "query": {
+      "pages": {
+        "3": {
+          "pageid": 3,
+          "title": "Tank:A01 T1 Cunningham",
+          "pageprops": {"displaytitle": "T1 Cunningham"},
+          "revisions": [
+            {
+              "*": "{{TankData\n|Tank=T1_Cunningham\n|InTheGame_performance=Stay hull-down and snipe from ridge lines.\n|InTheGame_tactics=Use cover on the ridge.\n}}\n[[Category:USA Tanks]]\n[[Category:Tier I Tanks]]\n[[Category:Light Tanks]]\n"
+            }
+          ]
+        }
+      }
+    }
+  }
+}

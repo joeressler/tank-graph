@@ -5,9 +5,8 @@ Tanks data. Python is responsible for respectful source collection, parsing, and
 NLP enrichment. Rust is responsible for validated ingestion, directed graph
 construction, queries, and benchmarks.
 
-This repository currently contains specifications only. It intentionally does
-not contain executable source code, package manifests, fixtures, generated
-datasets, or benchmark results.
+Milestone 1 provides the Python extractor. Later Rust milestones remain
+specifications until they are implemented in order.
 
 ## Canonical specifications
 
@@ -36,3 +35,49 @@ details.
 
 All live collection must identify the client, obey source policies, and pass
 through the shared rate limiter and retry policy defined by Milestone 1.
+
+## Python extractor
+
+Python 3.11 or newer is required. Create and activate a virtual environment,
+then install the package and its development tools:
+
+```powershell
+py -m venv .venv
+.\.venv\Scripts\Activate.ps1
+py -m pip install --upgrade pip
+py -m pip install -e ".\python[dev,model]"
+```
+
+The `model` extra is an explicit model installation step. A collection run
+verifies that `en_core_web_sm` is available but never downloads it.
+
+Run the offline test suite:
+
+```powershell
+py -m pytest python
+```
+
+Run a production collection non-interactively:
+
+```powershell
+py -m tank_graph_extractor extract `
+  --contact "joe.a.ressler+tankgraph@gmail.com" `
+  --output data/tanks_data.json
+```
+
+The equivalent installed command is:
+
+```powershell
+tank-graph-extract extract --contact "joe.a.ressler+tankgraph@gmail.com" --output data/tanks_data.json
+```
+
+Every production request attempt shares one limiter and starts at least five
+seconds after the previous attempt completed. Collection can therefore take a
+long time. The default official-guide allowlist is the newcomer getting-started
+page; Tank Coach video pages are omitted because they are not prose sources.
+The destination is replaced atomically only after every candidate has been
+processed and the complete root array passes schema and semantic validation.
+
+Use `py -m tank_graph_extractor --help` and
+`py -m tank_graph_extractor extract --help` for all configurable endpoints,
+timeouts, limits, and diagnostic options.

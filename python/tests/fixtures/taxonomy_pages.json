@@ -1,0 +1,61 @@
+{
+  "Category:Tanks": [
+    {
+      "query": {
+        "categorymembers": [
+          {"ns": 14, "title": "Category:Tanks by type"},
+          {"ns": 0, "pageid": 12, "title": "Tank:Orphan"}
+        ]
+      },
+      "continue": {"cmcontinue": "root-next", "continue": "-||"}
+    },
+    {
+      "query": {
+        "categorymembers": [
+          {"ns": 14, "title": "Category:Tanks by type"},
+          {"ns": 0, "pageid": 12, "title": "Tank:Orphan"}
+        ]
+      }
+    }
+  ],
+  "Category:Tanks by type": [
+    {
+      "query": {
+        "categorymembers": [
+          {"ns": 14, "title": "Category:Heavy tanks"},
+          {"ns": 14, "title": "Category:Medium tanks"}
+        ]
+      }
+    }
+  ],
+  "Category:Heavy tanks": [
+    {
+      "query": {
+        "categorymembers": [
+          {"ns": 14, "title": "Category:Autoloaders"},
+          {"ns": 0, "pageid": 1, "title": "Tank:Tiger I"}
+        ]
+      }
+    }
+  ],
+  "Category:Medium tanks": [
+    {
+      "query": {
+        "categorymembers": [
+          {"ns": 14, "title": "Category:Tanks"},
+          {"ns": 0, "pageid": 2, "title": "Tank:Medium"}
+        ]
+      }
+    }
+  ],
+  "Category:Autoloaders": [
+    {
+      "query": {
+        "categorymembers": [
+          {"ns": 0, "title": "Tank:Auto"},
+          {"ns": 0, "pageid": 1, "title": "Tank:Tiger I"}
+        ]
+      }
+    }
+  ]
+}
