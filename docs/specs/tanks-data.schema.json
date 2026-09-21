@@ -1,0 +1,164 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/joeressler/tank-graph/docs/specs/tanks-data.schema.json",
+  "title": "Tank Graph interchange dataset",
+  "description": "The complete JSON array produced by the Python extractor and consumed by the Rust graph engine.",
+  "type": "array",
+  "maxItems": 10000,
+  "items": {
+    "$ref": "#/$defs/tankRecord"
+  },
+  "$defs": {
+    "nonBlankText": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": ".*\\S.*"
+    },
+    "shortLabel": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/nonBlankText"
+        },
+        {
+          "maxLength": 120
+        }
+      ]
+    },
+    "orderedUniqueLabels": {
+      "type": "array",
+      "maxItems": 100,
+      "items": {
+        "$ref": "#/$defs/shortLabel"
+      },
+      "uniqueItems": true
+    },
+    "tankRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "display_name",
+        "class",
+        "subclasses",
+        "nation",
+        "tier",
+        "strategies",
+        "keywords"
+      ],
+      "properties": {
+        "name": {
+          "description": "Stable internal vehicle identifier without the MediaWiki namespace prefix.",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$"
+        },
+        "display_name": {
+          "description": "Human-readable vehicle name.",
+          "$ref": "#/$defs/shortLabel"
+        },
+        "class": {
+          "description": "Canonical primary vehicle class.",
+          "$ref": "#/$defs/shortLabel",
+          "enum": [
+            "Light Tanks",
+            "Medium Tanks",
+            "Heavy Tanks",
+            "Tank Destroyers",
+            "SPGs"
+          ]
+        },
+        "subclasses": {
+          "description": "Canonical narrower categories associated with the vehicle.",
+          "$ref": "#/$defs/orderedUniqueLabels"
+        },
+        "nation": {
+          "description": "Canonical nation label.",
+          "$ref": "#/$defs/shortLabel"
+        },
+        "tier": {
+          "description": "World of Tanks vehicle tier.",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10
+        },
+        "strategies": {
+          "description": "Clean tactical statements from wiki and applicable official-guide context.",
+          "type": "array",
+          "maxItems": 1000,
+          "items": {
+            "allOf": [
+              {
+                "$ref": "#/$defs/nonBlankText"
+              },
+              {
+                "maxLength": 1000
+              }
+            ]
+          },
+          "uniqueItems": true
+        },
+        "keywords": {
+          "description": "Normalized tactical concepts attributable to this record's strategies.",
+          "type": "array",
+          "maxItems": 1000,
+          "items": {
+            "allOf": [
+              {
+                "$ref": "#/$defs/nonBlankText"
+              },
+              {
+                "maxLength": 120
+              },
+              {
+                "pattern": "^[^\\r\\n\\t]+$"
+              }
+            ]
+          },
+          "uniqueItems": true
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "strategies": {
+                "maxItems": 0
+              }
+            },
+            "required": [
+              "strategies"
+            ]
+          },
+          "then": {
+            "properties": {
+              "keywords": {
+                "maxItems": 0
+              }
+            }
+          }
+        }
+      ],
+      "examples": [
+        {
+          "name": "G04_PzVI_Tiger_I",
+          "display_name": "Tiger I",
+          "class": "Heavy Tanks",
+          "subclasses": [],
+          "nation": "Germany",
+          "tier": 7,
+          "strategies": [
+            "Excels at long-range sniping due to high accuracy.",
+            "Hull armor is flat and easily penetrated; rely on sidescraping configurations."
+          ],
+          "keywords": [
+            "accuracy",
+            "hull armor",
+            "sidescraping",
+            "sniping"
+          ]
+        }
+      ]
+    }
+  }
+}
