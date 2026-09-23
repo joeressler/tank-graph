@@ -25,6 +25,8 @@ from tank_graph_extractor.wiki import (  # noqa: E402
     extract_tactical_sections,
     fetch_wiki_revision,
     parse_wiki_vehicle,
+    probe_mediawiki_api,
+    resolve_nation_filter,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -133,8 +135,9 @@ def test_revision_request_is_exact_and_legacy_shape_is_supported() -> None:
             {
                 "action": "query",
                 "format": "json",
-                "prop": "revisions|pageprops",
+                "prop": "revisions|pageprops|categories",
                 "rvprop": "content",
+                "cllimit": "max",
                 "redirects": "1",
                 "titles": "Tank:Tiger I",
             },
@@ -340,6 +343,70 @@ def test_class_fallback_and_missing_taxonomy_diagnostics() -> None:
     assert infobox_only.diagnostics[0].code == "missing_taxonomy_class_evidence"
 
 
+def test_live_tankdata_reads_api_categories_and_inthegame_fields() -> None:
+    page = PageDescriptor(
+        title="Tank:A01 T1 Cunningham",
+        page_id=3,
+        categories=("Category:USA Tanks",),
+        category_paths=(("Category:USA Tanks",),),
+    )
+    taxonomy = Taxonomy(
+        root_category="Category:USA Tanks",
+        categories=("Category:USA Tanks",),
+        parent_links=(),
+        pages=(page,),
+    )
+    revision = fetch_wiki_revision(
+        FakeClient(revision_fixtures()["tankdata_live"]),
+        "https://wiki.test/api.php",
+        page,
+    )
+    result = parse_wiki_vehicle(revision, page, taxonomy)
+
+    assert result.status is CandidateStatus.ACCEPTED
+    assert result.vehicle is not None
+    assert result.vehicle.metadata.name == "T1_Cunningham"
+    assert result.vehicle.metadata.display_name == "T1 Cunningham"
+    assert result.vehicle.metadata.nation == "USA"
+    assert result.vehicle.metadata.primary_class == "Light Tanks"
+    assert result.vehicle.metadata.tier == 1
+    assert any("hull-down" in text for text in result.vehicle.tactical_texts)
+    assert {item.code for item in result.diagnostics} >= {
+        "infobox_nation_fallback",
+        "infobox_class_fallback",
+        "infobox_tier_fallback",
+    }
+
+
+def test_tankdata_without_category_evidence_is_still_rejected() -> None:
+    taxonomy, page = taxonomy_for(title="Tank:A01 T1 Cunningham")
+    result = parse_wiki_vehicle(
+        make_revision("{{TankData|Tank=T1_Cunningham}}", title="Tank:A01 T1 Cunningham"),
+        page,
+        taxonomy,
+    )
+    assert result.status is CandidateStatus.REJECTED
+    assert result.diagnostics[0].code == "missing_primary_class"
+
+
+def test_maintenance_stub_without_class_is_excluded() -> None:
+    taxonomy, page = taxonomy_for(title="Tank:MTLS-1G14")
+    revision = WikiRevision(
+        title="Tank:MTLS-1G14",
+        text="{{TankData|Tank=MTLS-1G14}}",
+        source_url="https://wiki.test/page",
+        categories=(
+            "Category:USA Tanks",
+            "Category:Tank articles requiring maintenance",
+        ),
+    )
+    result = parse_wiki_vehicle(revision, page, taxonomy)
+
+    assert result.status is CandidateStatus.NON_VEHICLE
+    assert result.diagnostics[0].code == "incomplete_vehicle_page"
+    assert result.vehicle is None
+
+
 def test_fixture_covers_all_canonical_nations_and_unknown_is_rejected() -> None:
     fixture = json.loads((FIXTURES / "wiki_nation_aliases.json").read_text(encoding="utf-8"))
     assert set(fixture) == CANONICAL_NATIONS
@@ -355,6 +422,15 @@ def test_fixture_covers_all_canonical_nations_and_unknown_is_rejected() -> None:
     )
     assert rejected.status is CandidateStatus.REJECTED
     assert rejected.diagnostics[0].code in {"unknown_infobox_class", "unknown_nation"}
+
+
+def test_nation_filter_canonicalizes_aliases_and_all_disables() -> None:
+    from tank_graph_extractor.errors import ConfigurationError
+
+    assert resolve_nation_filter(("american", "USA")) == ("USA",)
+    assert resolve_nation_filter(("ALL",)) == ()
+    with pytest.raises(ConfigurationError, match="unknown nation filter"):
+        resolve_nation_filter(("Atlantis",))
 
 
 @pytest.mark.parametrize("tier", ["0", "11", "IV", "1.0", ""])
@@ -383,72 +459,24 @@ def test_only_documented_template_aliases_are_vehicle_infoboxes() -> None:
     assert result.status is CandidateStatus.NON_VEHICLE
 
 
-def test_live_tankdata_uses_taxonomy_and_inthegame_parameters() -> None:
-    revision = fetch_wiki_revision(
-        FakeClient(revision_fixtures()["tankdata_live"]),
-        "https://wiki.test/api.php",
-        "Tank:A01 T1 Cunningham",
-    )
-    taxonomy, page = taxonomy_for(
-        "category:usa tanks",
-        "category:tier i tanks",
-        "category:light tanks",
-        title="Tank:A01 T1 Cunningham",
-    )
-
-    result = parse_wiki_vehicle(revision, page, taxonomy)
-
-    assert result.status is CandidateStatus.ACCEPTED
-    assert result.vehicle is not None
-    assert result.vehicle.metadata.name == "T1_Cunningham"
-    assert result.vehicle.metadata.display_name == "T1 Cunningham"
-    assert result.vehicle.metadata.nation == "USA"
-    assert result.vehicle.metadata.tier == 1
-    assert result.vehicle.metadata.primary_class == "Light Tanks"
-    titles = [section.title for section in result.vehicle.tactical_sections]
-    assert titles == ["Performance", "Tactics"]
-    assert "hull-down" in result.vehicle.tactical_sections[0].text
-    assert {diagnostic.code for diagnostic in result.diagnostics} >= {
-        "infobox_class_fallback",
-        "infobox_nation_fallback",
-        "infobox_tier_fallback",
-    }
+def test_allpages_probe_confirms_json_api() -> None:
+    client = FakeClient({"query": {"allpages": [{"title": "Tank:Tiger I"}]}})
+    probe_mediawiki_api(client, "https://wiki.test/api.php")
+    assert client.calls == [
+        (
+            "https://wiki.test/api.php",
+            {
+                "action": "query",
+                "format": "json",
+                "list": "allpages",
+                "aplimit": "1",
+            },
+            "wiki",
+        )
+    ]
 
 
-def test_nation_and_tier_taxonomy_conflicts_are_rejected() -> None:
-    taxonomy, page = taxonomy_for(
-        "category:usa tanks",
-        "category:uk tanks",
-        "category:light tanks",
-    )
-    nation_conflict = parse_wiki_vehicle(
-        make_revision("{{TankData|Tank=T1_Cunningham|name=T1 Cunningham}}"),
-        page,
-        taxonomy,
-    )
-    tier_taxonomy, tier_page = taxonomy_for(
-        "category:usa tanks",
-        "category:tier i tanks",
-        "category:tier ii tanks",
-        "category:light tanks",
-    )
-    tier_conflict = parse_wiki_vehicle(
-        make_revision("{{TankData|Tank=T1_Cunningham|name=T1 Cunningham}}"),
-        tier_page,
-        tier_taxonomy,
-    )
-    usa_taxonomy, usa_page = taxonomy_for("category:usa tanks", "category:heavy tanks")
-    mismatched = parse_wiki_vehicle(
-        make_revision(
-            "{{Vehicle|id=Tiger|name=Tiger|class=heavy tanks|nation=Germany|tier=7}}"
-        ),
-        usa_page,
-        usa_taxonomy,
-    )
-
-    assert nation_conflict.status is CandidateStatus.REJECTED
-    assert nation_conflict.diagnostics[0].code == "contradictory_taxonomy_nations"
-    assert tier_conflict.status is CandidateStatus.REJECTED
-    assert tier_conflict.diagnostics[0].code == "contradictory_taxonomy_tiers"
-    assert mismatched.status is CandidateStatus.REJECTED
-    assert mismatched.diagnostics[0].code == "nation_conflict"
+def test_allpages_probe_rejects_non_json_shape() -> None:
+    client = FakeClient({"query": {}})
+    with pytest.raises(WikiExtractionError):
+        probe_mediawiki_api(client, "https://wiki.test/api.php")

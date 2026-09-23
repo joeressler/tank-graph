@@ -220,6 +220,7 @@ class WikiRevision:
     source_url: str
     display_title: str | None = None
     page_id: int | None = None
+    categories: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

@@ -16,6 +16,11 @@ ROOT = "https://worldoftanks.com/en/content/guide/"
 NEWCOMER = f"{ROOT}newcomers-guide/getting_started/"
 COACH = f"{ROOT}tank-coach-video-guides/"
 RESEARCH = f"{ROOT}tank-coach-video-guides/tank-coach-research/"
+COACH_ALLOWLIST = (
+    "newcomers-guide/getting_started/",
+    "tank-coach-video-guides/",
+    "tank-coach-video-guides/tank-coach-research/",
+)
 
 
 def fixture(name: str) -> str:
@@ -32,12 +37,20 @@ def test_url_identity_strips_fragment_and_tracking_but_enforces_boundaries() -> 
 
 
 def test_discovery_intersects_links_with_the_existing_allowlist() -> None:
-    children = discover_allowlisted_children(fixture("guide_tank_coach.html"), COACH)
+    children = discover_allowlisted_children(
+        fixture("guide_tank_coach.html"),
+        COACH,
+        allowlist=COACH_ALLOWLIST,
+    )
     assert children == (RESEARCH,)
 
 
 def test_current_tank_coach_index_is_valid_only_when_it_discovers_allowlisted_child() -> None:
-    result = parse_guide_html(fixture("guide_tank_coach_current.html"), COACH)
+    result = parse_guide_html(
+        fixture("guide_tank_coach_current.html"),
+        COACH,
+        allowlist=COACH_ALLOWLIST,
+    )
 
     assert result.segments == ()
     assert result.discovered_children == (RESEARCH,)
@@ -81,6 +94,22 @@ def test_parser_rejects_access_documents_and_layout_drift() -> None:
             "<html><head><title>Guide</title></head><body>Tactics and armor.</body></html>",
             NEWCOMER,
         )
+    with pytest.raises(GuideParseError, match="interstitial"):
+        parse_guide_html(
+            '<html><title>Loading site please wait...</title>'
+            '<div id="loading-content"></div></html>',
+            NEWCOMER,
+        )
+    assert (
+        discover_allowlisted_children(
+            (
+                '<html><title>Loading site please wait...</title>'
+                '<a href="tank-coach-video-guides/tank-coach-research/">x</a>'
+            ),
+            NEWCOMER,
+        )
+        == ()
+    )
     with pytest.raises(GuideParseError, match="implausibly short"):
         parse_guide_html(
             "<html><title>Guide</title><main><h1>Tactics</h1>"

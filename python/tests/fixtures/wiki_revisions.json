@@ -41,9 +41,14 @@
           "pageid": 3,
           "title": "Tank:A01 T1 Cunningham",
           "pageprops": {"displaytitle": "T1 Cunningham"},
+          "categories": [
+            {"ns": 14, "title": "Category:USA Tanks"},
+            {"ns": 14, "title": "Category:Tier I Tanks"},
+            {"ns": 14, "title": "Category:Light Tanks"}
+          ],
           "revisions": [
             {
-              "*": "{{TankData\n|Tank=T1_Cunningham\n|InTheGame_performance=Stay hull-down and snipe from ridge lines.\n|InTheGame_tactics=Use cover on the ridge.\n}}\n[[Category:USA Tanks]]\n[[Category:Tier I Tanks]]\n[[Category:Light Tanks]]\n"
+              "*": "{{TankData\n|Tank=T1_Cunningham\n|InTheGame_performance=Stay hull-down and snipe from ridge lines.\n|InTheGame_tactics=Use cover on the ridge.\n}}\n"
             }
           ]
         }

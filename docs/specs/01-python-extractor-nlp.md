@@ -53,16 +53,19 @@ Required production configuration:
 | Guide root | Defaults to `https://worldoftanks.com/en/content/guide/` |
 | Root category | Defaults to `Category:Tanks` |
 | User-Agent | `WoTGraphBot/<version> (contact: joe.a.ressler+tankgraph@gmail.com)` |
-| Minimum request interval | Fixed at no less than 3.0 seconds |
+| Minimum request interval | Fixed at no less than 5.0 seconds |
 | Connect timeout | Finite and separately configurable |
 | Read timeout | Finite and separately configurable |
 | Maximum attempts | Five total attempts per request |
-| Backoff | Exponential, bounded at 60 seconds, with injectable jitter |
+| Backoff | Exponential, at least 5 seconds, bounded at 15 seconds, with injectable jitter |
+| Wiki cookies | Optional `WIKI_COOKIE` from the wiki host after `#mw-content-text` loads |
+| Cookie refresh | Playwright exports wiki-host cookies only on a wait-page interstitial (`0` disables) |
+| Consecutive interstitial abort | Abort after 10 consecutive JS cookie/anti-bot pages |
 | Output | Defaults to `data/tanks_data.json` |
 
 Tests may inject local endpoints, fake clocks, zero-duration test intervals, and
 deterministic jitter. Production configuration must reject an interval below
-3.0 seconds. The contact value must contain a real email address or maintained
+5.0 seconds. The contact value must contain a real email address or maintained
 project URL; examples and placeholder domains are invalid.
 
 Only `http` and `https` are valid test endpoint schemes; production endpoints
@@ -76,10 +79,34 @@ One process-wide HTTP client and one limiter serve both hosts. Collection is
 sequential in this milestone; no thread, task, connection pool, or retry may
 bypass the limiter.
 
-The 3.0-second interval is measured with a monotonic clock from completion of
+The 5.0-second interval is measured with a monotonic clock from completion of
 one network attempt to the start of the next. Every attempt counts, including a
 redirect request, retry, response with an error status, timeout, or connection
-failure.
+failure. Requests send `Connection: close` and at most one in-flight GET.
+
+Wargaming wiki hosts may return HTTP 200 with a JS cookie/anti-bot interstitial
+instead of MediaWiki. `requests` never executes that challenge. A 200 body is
+blocked unless it is MediaWiki JSON (`{` or `[`) or article HTML
+(`#mw-content-text` / `.mw-parser-output`). Blocked bodies are never parsed,
+stored, or retried on the same URL over HTTP. Optional `WIKI_COOKIE` is the
+full Cookie header from the wiki host document request after the article
+loads; marketing-site `OptanonConsent` cookies and truncated values are
+rejected. Playwright is not the crawler: it waits for `#mw-content-text`,
+exports wiki-host cookies, and the HTTP client loads them into
+`requests.Session`. Playwright runs only when HTTP receives a wait-page
+interstitial, or when `--bootstrap-wiki-cookies` is used once at startup.
+`--cookie-refresh-every 0` disables that recovery. Successful wiki requests
+do not launch Chromium. A wait-page 200 refreshes cookies and retries that
+URL once after a successful cookie export. A hard WAF page
+(`Sorry, you have been blocked` / incident reference id) aborts immediately
+and does not launch Playwright. Ten consecutive wait-page responses abort
+the run.
+
+Before taxonomy traversal, probe
+`api.php?action=query&list=allpages&aplimit=1&format=json`. If that returns the
+loading HTML, wiki-host cookies or a browser bootstrap are required. If it
+returns JSON, continue discovery with `categorymembers`. Do not scrape HTML
+`Special:AllPages`.
 
 ### Request pseudocode
 
@@ -89,19 +116,22 @@ FUNCTION respectful_get(url, query):
     ASSERT request method is GET
 
     FOR attempt_number FROM 1 THROUGH 5:
-        limiter.wait_until_at_least_3_seconds_after_previous_completion()
+        limiter.wait_until_at_least_5_seconds_after_previous_completion()
 
         TRY:
             response = session.GET(
                 url,
                 query,
                 configured_user_agent,
+                connection_close,
+                wiki_host_cookie_if_configured,
                 finite_connect_and_read_timeouts,
                 streamed_response
             )
             response = read_no_more_than_configured_size(response)
         CATCH transient_connection_or_timeout_error AS error:
             limiter.record_attempt_completion(monotonic_now)
+            recreate_session()
             IF attempt_number IS 5:
                 RAISE terminal_network_error(url, attempt_number, error)
             sleep(retry_delay(attempt_number, no_retry_after))
@@ -109,16 +139,18 @@ FUNCTION respectful_get(url, query):
 
         limiter.record_attempt_completion(monotonic_now)
 
+        IF response.status IS 2xx AND is_bot_interstitial(body):
+            RAISE blocked_interstitial_without_http_retry(url)
+
         IF response.status IS 2xx:
             RETURN response
 
         IF response.status IS 429 OR response.status IS BETWEEN 500 AND 599:
             IF attempt_number IS 5:
                 RAISE retry_exhausted(url, response.status, attempt_number)
-            delay = MAX(
-                valid_retry_after(response.headers),
-                bounded_exponential_backoff_with_jitter(attempt_number)
-            )
+            delay = valid_retry_after(response.headers)
+            IF delay IS missing:
+                delay = bounded_exponential_backoff_at_least_5s_cap_15s(attempt_number)
             sleep(delay)
             CONTINUE
 
@@ -198,10 +230,10 @@ subclasses. The initial canonical mapping is:
 
 | Normalized wiki value or category leaf | Output |
 | --- | --- |
-| `light tank`, `light tanks` | Primary class `Light Tanks` |
-| `medium tank`, `medium tanks` | Primary class `Medium Tanks` |
-| `heavy tank`, `heavy tanks` | Primary class `Heavy Tanks` |
-| `tank destroyer`, `tank destroyers` | Primary class `Tank Destroyers` |
+| `light tank`, `light tanks`, `light`, `lt`, `lighttank` | Primary class `Light Tanks` |
+| `medium tank`, `medium tanks`, `medium`, `mt`, `mediumtank` | Primary class `Medium Tanks` |
+| `heavy tank`, `heavy tanks`, `heavy`, `ht`, `heavytank` | Primary class `Heavy Tanks` |
+| `tank destroyer`, `tank destroyers`, `td`, `ttd`, `at-spg`, `atspg` | Primary class `Tank Destroyers` |
 | `spg`, `spgs`, `artillery`, `self-propelled gun`, `self-propelled guns` | Primary class `SPGs` |
 | `autoloader`, `autoloaders` | Subclass `Autoloaders` |
 
@@ -224,8 +256,9 @@ For each candidate vehicle page, request:
 
 - `action=query`
 - `format=json`
-- `prop=revisions|pageprops`
+- `prop=revisions|pageprops|categories`
 - `rvprop=content`
+- `cllimit=max`
 - `redirects=1`
 - `titles=<full page title>`
 
@@ -269,14 +302,25 @@ Required normalized output values:
 | `display_name` | Explicit display-name field, then display-title page property, then cleaned title suffix |
 | `class` | Reconciled canonical infobox class/type and taxonomy evidence using the algorithm below |
 | `subclasses` | Allowed taxonomy categories associated with this page, excluding the primary class |
-| `nation` | Canonicalized infobox nation |
-| `tier` | Base-10 integer from the infobox, in the range 1 through 10 |
+| `nation` | Canonicalized infobox nation; if omitted, a unique nation category such as `Category:USA Tanks` |
+| `tier` | Base-10 integer from the infobox, in the range 1 through 10; if omitted, a unique `Category:Tier I Tanks` (or decimal equivalent) |
 
 Template parameter values are stripped of comments and wiki markup before
-validation. Except for the documented class fallback below, a required value
-that remains ambiguous or empty rejects that candidate in strict production
-mode. The extractor must report all rejected candidates at the end and must not
-publish a replacement output file when any candidate fails.
+validation. The deployed wiki `TankData` infobox often omits nation, class, and
+tier. Those values are applied by the template as MediaWiki categories, which
+do not appear as `[[Category:...]]` wikilinks in the revision text. The
+revision query therefore also requests `categories`. Those API categories, any
+revision wikilinks, and taxonomy membership are eligible fallbacks when the
+matching infobox field is empty.
+An unrecognized non-empty infobox value is still a conflict and is not eligible
+for category fallback. A required value that remains ambiguous or empty rejects
+that candidate. A page in `Category:Tank articles requiring maintenance` that
+still lacks nation, class, or tier is an incomplete stub: exclude it with
+`incomplete_vehicle_page` and do not count it as a rejected vehicle. The
+extractor reports every rejected candidate, including diagnostic codes.
+Accepted vehicles are still validated and published. The run fails without
+replacing output only when no vehicle is accepted, or when schema or semantic
+validation fails.
 
 ### Primary-class reconciliation
 
@@ -315,7 +359,9 @@ being hidden by category evidence.
 
 Section titles are normalized by removing markup, trimming, collapsing
 whitespace, and case folding. `Performance` and `Tactics` are accepted. A page
-may contain either or both.
+may contain either or both. When those headings are absent, the live `TankData`
+parameters `InTheGame_performance` and `InTheGame_tactics` are accepted as the
+same logical sections.
 
 For an accepted section:
 
@@ -337,11 +383,12 @@ does not fabricate text.
 ### Allowlist
 
 The collector fetches only configured URLs whose normalized paths are beneath
-the guide root. The initial allowlist includes:
+the guide root. The production allowlist is:
 
 - `newcomers-guide/getting_started/`
-- `tank-coach-video-guides/`
-- `tank-coach-video-guides/tank-coach-research/`
+
+Tank Coach video-guide routes are not collected. Tests may still exercise those
+layouts when they are explicitly configured.
 
 Following links is not a general crawl. A child page is fetched only when its
 path is under the guide root, matches the configured Tank Coach path prefix,
@@ -570,7 +617,8 @@ removed on handled failure.
 | Transient timeout/connection failure | Retry according to the bounded policy |
 | Malformed API/HTML response | Fail with source and parser-stage context |
 | Non-vehicle category page | Exclude with a classified diagnostic |
-| Candidate vehicle missing required metadata | Accumulate rejection; do not publish output |
+| Candidate vehicle missing required metadata | Accumulate rejection; publish accepted vehicles; fail without replacement output only when none are accepted |
+| Maintenance stub missing nation, class, or tier | Exclude as `incomplete_vehicle_page`; do not count it as a rejection |
 | Missing tactical sections | Accept the tank with empty tactical arrays if no guide applies |
 | Schema or semantic validation failure | Do not replace existing output |
 
@@ -582,8 +630,9 @@ keyword count, retry count, and output path.
 
 | Area | Required cases |
 | --- | --- |
-| Limiter | First call immediate; subsequent calls at least 3.0 seconds after prior completion; retries and both hosts share the interval |
-| Retry | `429`, every `5xx` family fixture, `Retry-After`, timeout, cap, exhaustion, and fatal `4xx` |
+| Limiter | First call immediate; subsequent calls at least 5.0 seconds after prior completion; retries and both hosts share the interval |
+| Retry | `429`, every `5xx` family fixture, `Retry-After`, timeout, cap 15s, exhaustion, and fatal `4xx` |
+| Interstitial | Spinner/blocked HTML vs MediaWiki HTML/JSON; no HTTP retry of the spinner; abort after consecutive blocks; wiki-host cookies only; Playwright only on wait-page or explicit bootstrap |
 | Categories | Pagination, duplicate pages, cycles, repeated subcategories, deterministic ordering |
 | Revisions | Legacy content shape, modern compatibility shape, redirect, missing page, missing revision, API error |
 | Templates | Parameter order, whitespace/case aliases, wiki markup, missing field, ambiguous multiple infoboxes |
@@ -612,7 +661,7 @@ The generated production dataset is an output, not a hand-edited source file.
 
 - [ ] A missing or placeholder bot contact fails before network access.
 - [ ] Every sequential network attempt is separated from the previous
-      completion by at least 3.0 seconds in production configuration.
+      completion by at least 5.0 seconds in production configuration.
 - [ ] `429` and `5xx` retries are bounded, honor valid `Retry-After`, and cannot
       bypass the shared limiter.
 - [ ] `Category:Tanks` traversal handles continuation and cycles and produces

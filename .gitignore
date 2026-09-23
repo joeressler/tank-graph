@@ -7,3 +7,5 @@ __pycache__/
 *.egg-info/
 python/build/
 python/dist/
+rust/target/
+data/

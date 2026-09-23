@@ -118,6 +118,8 @@ def test_exact_class_subclass_and_organizational_maps() -> None:
         "SPGs",
     } == CANONICAL_PRIMARY_CLASSES
     assert canonicalize_primary_class("Category:Self-propelled_guns") == "SPGs"
+    assert canonicalize_primary_class("light") == "Light Tanks"
+    assert canonicalize_primary_class("td") == "Tank Destroyers"
     assert canonicalize_primary_class("scouts") is None
     assert canonicalize_subclass("Category:Autoloader") == "Autoloaders"
     assert canonicalize_subclass("Category:Premium tanks") is None

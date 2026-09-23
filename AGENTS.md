@@ -48,3 +48,24 @@ These instructions apply to the entire repository.
 - Run the narrow relevant tests first, then the completed milestone suite.
 - Before handoff, verify formatting/lints, deterministic output, documented
   examples, and all applicable exit criteria.
+
+## Learned User Preferences
+
+- Prefer a minimum ~5 second request interval for live wiki and guide scraping.
+- Exclude tank-coach / video guide paths from extraction; keep text guide sources.
+- Persist valid extract records when one vehicle fails validation; do not reject
+  the entire batch for a single bad record.
+- Refresh wiki cookies with Playwright only when blocked or interstitial HTML is
+  detected, not on a fixed proactive schedule while a session still works.
+
+## Learned Workspace Facts
+
+- Live CLI extract currently defaults to a temporary USA-only subset
+  (`Category:USA Tanks` / nation USA) so Rust work can start; full crawl uses
+  `Category:Tanks` with `--nation ALL`.
+- Wargaming wiki hosts often return JS/cookie anti-bot interstitial pages with
+  HTTP 200 that are not MediaWiki; detect and never parse or store them as
+  articles; scraping needs wiki-host session cookies, not marketing-site cookies
+  alone.
+- Live tank primary class is often absent from wikitext `Category:` links and
+  comes from MediaWiki category membership / TankData-related categories.

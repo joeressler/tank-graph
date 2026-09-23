@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -11,12 +10,11 @@ from urllib.parse import urljoin, urlsplit
 
 from .assemble import AssemblyResult, assemble_records
 from .config import ExtractorConfig
-from .errors import TankGraphError, safe_url
+from .errors import BotInterstitialError, ConsecutiveInterstitialError, TankGraphError
 from .guides import GuideDiagnostic, GuideParseError, GuideSegment, parse_guide_html
 from .http import HttpClient
 from .models import (
     CandidateStatus,
-    DiagnosticSeverity,
     ExtractionDiagnostic,
     WikiVehicle,
 )
@@ -24,7 +22,7 @@ from .nlp import ConceptExtractor, get_nlp
 from .output import write_dataset_atomic
 from .policy import PolicyChecker, PolicyReport
 from .taxonomy import crawl_taxonomy
-from .wiki import WikiExtractor
+from .wiki import WikiExtractor, canonicalize_nation, probe_mediawiki_api
 
 
 class ExtractionRunError(TankGraphError):
@@ -33,6 +31,29 @@ class ExtractionRunError(TankGraphError):
     def __init__(self, message: str, diagnostics: tuple[Any, ...] = ()) -> None:
         self.diagnostics = diagnostics
         super().__init__(message)
+
+    def __str__(self) -> str:
+        text = super().__str__()
+        counts: dict[str, int] = {}
+        for item in self.diagnostics:
+            code = getattr(item, "code", None)
+            if not isinstance(code, str) or not code:
+                continue
+            counts[code] = counts.get(code, 0) + 1
+        if not counts:
+            return text
+        summary = ", ".join(f"{code}={count}" for code, count in sorted(counts.items()))
+        return f"{text} ({summary})"
+
+
+def _allowed_nations(config: ExtractorConfig) -> frozenset[str]:
+    allowed: set[str] = set()
+    for nation in config.nations:
+        canonical = canonicalize_nation(nation)
+        if canonical is None:
+            raise ExtractionRunError(f"nation filter is not canonical: {nation}")
+        allowed.add(canonical)
+    return frozenset(allowed)
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,22 +86,12 @@ class RunSummary:
         )
 
 
-def _diagnostic_text(diagnostic: Any) -> str:
-    code = getattr(diagnostic, "code", None)
-    reason = getattr(diagnostic, "reason", None)
-    message = getattr(diagnostic, "message", str(diagnostic))
-    title = getattr(diagnostic, "page_title", None)
-    prefix = code or reason or "diagnostic"
-    if title:
-        return f"{prefix}: {title}: {message}"
-    return f"{prefix}: {message}"
-
-
 def _collect_guides(
     config: ExtractorConfig,
     client: HttpClient,
     policy: PolicyReport,
-    log: logging.Logger,
+    *,
+    logger: logging.Logger,
 ) -> tuple[tuple[GuideSegment, ...], tuple[GuideDiagnostic, ...], int]:
     segments: list[GuideSegment] = []
     diagnostics: list[GuideDiagnostic] = []
@@ -93,13 +104,17 @@ def _collect_guides(
     }
     direct_urls = sorted(allowed - child_urls)
     discovered_children: set[str] = set()
-    log.info("guides: fetching %d authorized page(s)", len(allowed))
 
     for url in direct_urls:
         if url in fetched:
             continue
-        log.info("guides: GET %s", safe_url(url))
-        response = client.get(url)
+        try:
+            response = client.get(url)
+        except ConsecutiveInterstitialError:
+            raise
+        except BotInterstitialError:
+            logger.warning("skipping blocked guide page %s", url)
+            continue
         try:
             parsed = parse_guide_html(
                 response.text,
@@ -113,16 +128,15 @@ def _collect_guides(
         segments.extend(parsed.segments)
         diagnostics.extend(parsed.diagnostics)
         discovered_children.update(parsed.discovered_children)
-        log.info(
-            "guides: retained %d segment(s) and %d diagnostic(s) from %s",
-            len(parsed.segments),
-            len(parsed.diagnostics),
-            safe_url(response.url or url),
-        )
 
     for url in sorted(child_urls & discovered_children):
-        log.info("guides: GET discovered child %s", safe_url(url))
-        response = client.get(url)
+        try:
+            response = client.get(url)
+        except ConsecutiveInterstitialError:
+            raise
+        except BotInterstitialError:
+            logger.warning("skipping blocked guide page %s", url)
+            continue
         try:
             parsed = parse_guide_html(
                 response.text,
@@ -135,82 +149,70 @@ def _collect_guides(
         fetched.add(url)
         segments.extend(parsed.segments)
         diagnostics.extend(parsed.diagnostics)
-        log.info(
-            "guides: retained %d segment(s) from %s",
-            len(parsed.segments),
-            safe_url(response.url or url),
-        )
 
-    log.info("guides: finished %d page(s), %d assignable segment(s)", len(fetched), len(segments))
     return tuple(segments), tuple(diagnostics), len(fetched)
 
 
 def _collect_wiki(
     config: ExtractorConfig,
     client: HttpClient,
-    log: logging.Logger,
+    *,
+    logger: logging.Logger,
 ) -> tuple[Any, tuple[WikiVehicle, ...], tuple[ExtractionDiagnostic, ...], int]:
-    log.info("wiki: crawling taxonomy from %s", config.root_category)
+    allowed_nations = _allowed_nations(config)
     taxonomy = crawl_taxonomy(client, config.wiki_endpoint, config.root_category)
+    pause = getattr(client, "pause_between_phases", None)
+    if callable(pause):
+        pause("pausing after taxonomy discovery before article fetches")
     extractor = WikiExtractor(client, config.wiki_endpoint)
     vehicles: list[WikiVehicle] = []
     diagnostics: list[ExtractionDiagnostic] = []
+    rejection_diagnostics: list[ExtractionDiagnostic] = []
     rejected = 0
-    excluded = 0
-    total = len(taxonomy.pages)
-    log.info("wiki: extracting %d candidate page(s)", total)
-    started = time.monotonic()
 
-    for index, page in enumerate(taxonomy.pages, start=1):
-        elapsed = time.monotonic() - started
-        remaining = ((elapsed / (index - 1)) * (total - index + 1)) if index > 1 else 0.0
-        log.info(
-            "wiki: %d/%d GET %s (elapsed %.0fs, ~%.0fs remaining)",
-            index,
-            total,
-            page.title,
-            elapsed,
-            remaining,
-        )
-        result = extractor.extract(page, taxonomy)
+    for page in taxonomy.pages:
+        try:
+            result = extractor.extract(page, taxonomy)
+        except ConsecutiveInterstitialError:
+            raise
+        except BotInterstitialError:
+            logger.warning("skipping blocked wiki page %s", page.title)
+            continue
         diagnostics.extend(result.diagnostics)
         if result.status is CandidateStatus.ACCEPTED:
             if result.vehicle is None:
                 raise ExtractionRunError(f"accepted candidate {page.title!r} has no parsed vehicle")
+            nation = result.vehicle.metadata.nation
+            if allowed_nations and nation not in allowed_nations:
+                logger.info(
+                    "skipping wiki page %s nation=%s (temporary nation filter %s)",
+                    page.title,
+                    nation,
+                    ",".join(config.nations),
+                )
+                continue
             vehicles.append(result.vehicle)
-            log.info(
-                "wiki: accepted %s as %s (%s, tier %s)",
-                page.title,
-                result.vehicle.metadata.name,
-                result.vehicle.metadata.primary_class,
-                result.vehicle.metadata.tier,
-            )
         elif result.status is CandidateStatus.REJECTED:
             rejected += 1
-            detail = (
-                _diagnostic_text(result.diagnostics[0]) if result.diagnostics else "rejected"
-            )
-            log.warning("wiki: rejected %s: %s", page.title, detail)
-        else:
-            excluded += 1
-            log.info("wiki: excluded non-vehicle %s", page.title)
+            rejection_diagnostics.extend(result.diagnostics)
+            for diagnostic in result.diagnostics:
+                logger.warning(
+                    "rejected wiki page %s: %s (%s)",
+                    page.title,
+                    diagnostic.code,
+                    diagnostic.message,
+                )
 
-    log.info(
-        "wiki: accepted %d, excluded %d, rejected %d",
-        len(vehicles),
-        excluded,
-        rejected,
-    )
-    if rejected:
-        samples = [
-            _diagnostic_text(diagnostic)
-            for diagnostic in diagnostics
-            if getattr(diagnostic, "severity", None) is DiagnosticSeverity.ERROR
-        ][:8]
-        detail = "; ".join(samples) if samples else "see logs"
+    if rejected and not vehicles:
         raise ExtractionRunError(
-            f"{rejected} vehicle candidate(s) were rejected; output was not published ({detail})",
-            tuple(diagnostics),
+            f"{rejected} vehicle candidate(s) were rejected; output was not published",
+            tuple(rejection_diagnostics),
+        )
+    if rejected:
+        logger.warning(
+            "%d vehicle candidate(s) were rejected; publishing %d accepted vehicle(s)",
+            rejected,
+            len(vehicles),
         )
     return taxonomy, tuple(vehicles), tuple(diagnostics), rejected
 
@@ -230,37 +232,30 @@ def run_extraction(
     if not schema_path.is_file():
         raise ExtractionRunError(f"JSON Schema does not exist: {schema_path}")
 
-    log.info(
-        "startup: interval=%.1fs output=%s wiki=%s guides=%d",
-        config.request_interval,
-        config.output_path,
-        config.wiki_endpoint,
-        len(config.guide_paths),
-    )
     # Loading before client construction guarantees a missing model cannot open sockets.
     nlp_model = sentence_nlp if sentence_nlp is not None else get_nlp()
-    log.info("startup: spaCy model is available")
     owned_client = client is None
     http = client if client is not None else HttpClient(config)
     if http.config != config:
         raise ExtractionRunError("injected HTTP client uses different configuration")
 
     try:
-        log.info("policy: checking robots.txt for required wiki and optional guides")
         policy_report = PolicyChecker(config, http, logger=log).check_sources()
-        log.info(
-            "policy: allowed %d guide(s), skipped %d",
-            len(policy_report.allowed_guides),
-            len(policy_report.skipped_guides),
-        )
+        try:
+            probe_mediawiki_api(http, config.wiki_endpoint)
+        except ConsecutiveInterstitialError:
+            raise
+        except BotInterstitialError as error:
+            raise ExtractionRunError(
+                "MediaWiki API returned a JS cookie/anti-bot interstitial instead of JSON. "
+                "Capture WIKI_COOKIE from the wiki host document request after "
+                "#mw-content-text loads."
+            ) from error
         guide_segments, guide_diagnostics, guide_count = _collect_guides(
-            config, http, policy_report, log
+            config, http, policy_report, logger=log
         )
-        taxonomy, vehicles, wiki_diagnostics, rejected = _collect_wiki(config, http, log)
-        log.info(
-            "assembly: merging %d tanks with %d guide segment(s)",
-            len(vehicles),
-            len(guide_segments),
+        taxonomy, vehicles, wiki_diagnostics, rejected = _collect_wiki(
+            config, http, logger=log
         )
         assembly: AssemblyResult = assemble_records(
             vehicles,
@@ -268,7 +263,6 @@ def run_extraction(
             sentence_nlp=nlp_model,
             concept_extractor=ConceptExtractor(nlp_model),
         )
-        log.info("output: validating and writing %s", config.output_path)
         write_dataset_atomic(
             assembly.records,
             config.output_path,
@@ -280,8 +274,7 @@ def run_extraction(
             http.close()
 
     for diagnostic in (*wiki_diagnostics, *guide_diagnostics):
-        log.info("%s", _diagnostic_text(diagnostic))
-    log.info("output: published %s", config.output_path)
+        log.info("%s: %s", getattr(diagnostic, "reason", "diagnostic"), diagnostic)
 
     records = assembly.records
     return RunSummary(

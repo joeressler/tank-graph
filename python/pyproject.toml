@@ -23,6 +23,9 @@ dev = [
     "pytest>=8.3,<9",
     "ruff>=0.11,<1",
 ]
+playwright = [
+    "playwright>=1.47,<2",
+]
 
 [project.scripts]
 tank-graph-extract = "tank_graph_extractor.__main__:main"

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import random
 import threading
@@ -17,7 +18,9 @@ import requests
 
 from .config import ExtractorConfig
 from .errors import (
+    BotInterstitialError,
     ConfigurationError,
+    ConsecutiveInterstitialError,
     HttpStatusError,
     NetworkError,
     RedirectError,
@@ -26,8 +29,20 @@ from .errors import (
     RetryExhaustedError,
     safe_url,
 )
+from .interstitial import (
+    FetchResult,
+    cookie_pairs,
+    is_bot_interstitial,
+    is_hard_waf_block,
+    looks_like_mediawiki_json,
+    strip_marketing_cookies,
+)
 
 _REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
+
+
+class _RetryAfterCookieRefresh(Exception):
+    """Redo the same wiki GET once after a required Playwright cookie export."""
 
 
 class AttemptLimiter:
@@ -99,35 +114,6 @@ def _without_query_or_fragment(url: str) -> str:
     return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
 
 
-def _request_label(url: str, params: Mapping[str, Any] | None) -> str:
-    """Describe a request for logs without query strings or response bodies."""
-    label = safe_url(url)
-    if not params:
-        return label
-    details: list[str] = []
-    for key in ("cmtitle", "titles", "list"):
-        value = params.get(key)
-        if isinstance(value, str) and value:
-            details.append(f"{key}={value}")
-    if params.get("cmcontinue"):
-        details.append("continued")
-    if not details:
-        return label
-    return f"{label} {' '.join(details)}"
-
-
-def _looks_like_html(response: requests.Response) -> bool:
-    content_type = (response.headers.get("Content-Type") or "").split(";", 1)[0].strip().casefold()
-    if content_type in {"text/html", "application/xhtml+xml"}:
-        return True
-    body = (response.text or "").lstrip()[:32].casefold()
-    return body.startswith("<!doctype html") or body.startswith("<html")
-
-
-def _unexpected_html_payload(source_kind: str, response: requests.Response) -> bool:
-    return source_kind in {"wiki", "robots"} and _looks_like_html(response)
-
-
 class HttpClient:
     """One session and limiter implementing all network safety rules."""
 
@@ -141,9 +127,11 @@ class HttpClient:
         sleep: Callable[[float], None] = time.sleep,
         jitter: Callable[[float], float] = _default_jitter,
         logger: logging.Logger | None = None,
+        cookie_refresher: Callable[[], str] | None = None,
     ) -> None:
         # Dataclass construction performs all startup checks before a session can be used.
         self.config = config
+        self._owns_session = session is None
         self.session = session if session is not None else requests.Session()
         self.limiter = AttemptLimiter(config.request_interval, clock=clock, sleep=sleep)
         self._wall_clock = wall_clock
@@ -152,6 +140,13 @@ class HttpClient:
         self._logger = logger or logging.getLogger(__name__)
         self._request_lock = threading.Lock()
         self.retry_count = 0
+        self.consecutive_blocks = 0
+        self._cookie_refresher = cookie_refresher
+        self._cookie_broker: Any | None = None
+        self._wiki_cookie = config.wiki_cookie
+        self._session_wiki_cookie_names: set[str] = set()
+        if self._wiki_cookie:
+            self._apply_wiki_cookie(self._wiki_cookie)
 
     def __enter__(self) -> Self:
         return self
@@ -165,9 +160,34 @@ class HttpClient:
         self.close()
 
     def close(self) -> None:
+        broker = self._cookie_broker
+        self._cookie_broker = None
+        if broker is not None:
+            closer = getattr(broker, "close", None)
+            if closer is not None:
+                closer()
         close = getattr(self.session, "close", None)
         if close is not None:
             close()
+
+    def _recreate_session(self) -> None:
+        if not self._owns_session:
+            return
+        close = getattr(self.session, "close", None)
+        if close is not None:
+            with contextlib.suppress(OSError, requests.RequestException):
+                close()
+        self.session = requests.Session()
+        if self._wiki_cookie:
+            self._apply_wiki_cookie(self._wiki_cookie)
+
+    def pause_between_phases(self, reason: str) -> None:
+        """Insert one extra limiter slot after a discovery burst."""
+        self._logger.info("%s", reason)
+        if self.config.request_interval <= 0:
+            return
+        self.limiter.wait()
+        self.limiter.record_completion()
 
     def _read_response(self, response: requests.Response, url: str) -> None:
         content_length = response.headers.get("Content-Length")
@@ -197,22 +217,192 @@ class HttpClient:
         response._content = bytes(body)
         response._content_consumed = True
 
-    def _retry_delay(self, attempt: int, retry_after: str | None, url: str) -> float:
-        base = min(60.0, float(2 ** (attempt - 1)))
+    def _request_headers(self, url: str) -> dict[str, str]:
+        headers = {
+            "User-Agent": self.config.user_agent,
+            "Connection": "close",
+        }
+        if self._wiki_cookie and self.config.is_wiki_host(url):
+            headers["Cookie"] = self._wiki_cookie
+        return headers
+
+    def _cookie_refresh_enabled(self) -> bool:
+        if self.config.cookie_refresh_every <= 0:
+            return False
+        if self._cookie_refresher is not None:
+            return True
+        return not self.config.test_mode
+
+    def _needs_wiki_cookies(self, source_kind: str, url: str) -> bool:
+        """Wiki API and wiki-host robots.txt share the same Imperva cookie gate."""
+        return source_kind == "wiki" or (
+            source_kind == "robots" and self.config.is_wiki_host(url)
+        )
+
+    def _apply_wiki_cookie(self, header: str) -> None:
+        cleaned = strip_marketing_cookies(header)
+        self._wiki_cookie = cleaned or None
+        jar = getattr(self.session, "cookies", None)
+        setter = getattr(jar, "set", None)
+        clearer = getattr(jar, "clear", None)
+        domain = urlsplit(self.config.wiki_endpoint).hostname
+        if setter is None or domain is None:
+            return
+        for name in list(self._session_wiki_cookie_names):
+            if clearer is not None:
+                with contextlib.suppress(KeyError, ValueError, TypeError):
+                    clearer(domain, "/", name)
+        self._session_wiki_cookie_names.clear()
+        if not cleaned:
+            return
+        for name, value in cookie_pairs(cleaned):
+            setter(name, value, domain=domain, path="/")
+            self._session_wiki_cookie_names.add(name)
+
+    def _playwright_refresh(self, *, force_navigate: bool = False) -> str:
+        if self._cookie_broker is None:
+            from .browser import PlaywrightCookieBroker
+
+            self._cookie_broker = PlaywrightCookieBroker(self.config)
+        return self._cookie_broker.refresh(
+            existing_cookie=self._wiki_cookie,
+            force_navigate=force_navigate,
+        )
+
+    def _refresh_wiki_cookies(self, *, force_navigate: bool = False) -> None:
+        self._logger.info("refreshing wiki-host cookies via Playwright")
+        self.limiter.wait()
         try:
-            jitter = float(self._jitter(base))
-        except (TypeError, ValueError, OverflowError) as error:
-            raise ConfigurationError("jitter must return a finite number") from error
-        if not (0.0 <= jitter < float("inf")):
-            raise ConfigurationError("jitter must return a finite non-negative number")
-        backoff = min(60.0, base + jitter)
+            try:
+                if self._cookie_refresher is not None:
+                    header = self._cookie_refresher()
+                else:
+                    header = self._playwright_refresh(force_navigate=force_navigate)
+            except (BotInterstitialError, ConfigurationError) as error:
+                raise ConsecutiveInterstitialError(
+                    getattr(error, "url", self.config.wiki_endpoint),
+                    "aborting because wiki cookie refresh failed",
+                    max(self.consecutive_blocks, 1),
+                ) from error
+            self._apply_wiki_cookie(header)
+        finally:
+            self.limiter.record_completion()
+
+    def _response_text(self, response: requests.Response) -> str:
+        try:
+            text = response.text
+        except (LookupError, UnicodeError, AttributeError):
+            text = (response.content or b"").decode("utf-8", "replace")
+        return text if isinstance(text, str) else ""
+
+    def _inspect(self, response: requests.Response, url: str) -> FetchResult:
+        body = self._response_text(response)
+        return FetchResult(
+            url=url,
+            status_code=response.status_code,
+            body=body,
+            blocked=is_bot_interstitial(body),
+            content_type=str(response.headers.get("Content-Type", "")),
+        )
+
+    def _raise_blocked(self, result: FetchResult) -> None:
+        self.consecutive_blocks += 1
+        self._logger.warning(
+            "Blocked wiki/JS interstitial at %s consecutive=%d; "
+            "not parsing body and not retrying this URL over HTTP. "
+            "Capture WIKI_COOKIE from the wiki host after #mw-content-text loads.",
+            safe_url(result.url),
+            self.consecutive_blocks,
+        )
+        if self.consecutive_blocks >= self.config.max_consecutive_blocks:
+            raise ConsecutiveInterstitialError(
+                result.url,
+                "aborting after consecutive JS cookie/anti-bot interstitials",
+                self.consecutive_blocks,
+            )
+        raise BotInterstitialError(
+            result.url,
+            "HTTP 200 is a JS cookie/anti-bot interstitial, not MediaWiki",
+            self.consecutive_blocks,
+        )
+
+    def _accept_success(
+        self,
+        response: requests.Response,
+        url: str,
+        source_kind: str,
+        *,
+        allow_cookie_retry: bool,
+    ) -> requests.Response:
+        result = self._inspect(response, url)
+        if result.blocked:
+            if is_hard_waf_block(result.body):
+                self.consecutive_blocks += 1
+                raise ConsecutiveInterstitialError(
+                    result.url,
+                    "aborting because the wiki WAF blocked this client; "
+                    "do not retry until a normal browser can load the article",
+                    self.consecutive_blocks,
+                )
+            if (
+                self._needs_wiki_cookies(source_kind, url)
+                and allow_cookie_retry
+                and self._cookie_refresh_enabled()
+            ):
+                self.consecutive_blocks += 1
+                self._logger.warning(
+                    "Blocked wiki/JS interstitial at %s consecutive=%d; "
+                    "refreshing wiki-host cookies and retrying this URL once",
+                    safe_url(result.url),
+                    self.consecutive_blocks,
+                )
+                if self.consecutive_blocks >= self.config.max_consecutive_blocks:
+                    raise ConsecutiveInterstitialError(
+                        result.url,
+                        "aborting after consecutive JS cookie/anti-bot interstitials",
+                        self.consecutive_blocks,
+                    )
+                self._refresh_wiki_cookies(force_navigate=True)
+                raise _RetryAfterCookieRefresh
+            self._raise_blocked(result)
+        self.consecutive_blocks = 0
+        if source_kind == "wiki" and not looks_like_mediawiki_json(result.body):
+            raise HttpStatusError(url, "unexpected HTML from MediaWiki API", 200)
+        return response
+
+    def _retry_delay(self, attempt: int, retry_after: str | None, url: str) -> float:
         parsed_retry_after = parse_retry_after(retry_after, now=self._wall_clock)
         if retry_after is not None and parsed_retry_after is None:
             self._logger.warning(
                 "Ignoring invalid Retry-After from %s",
                 safe_url(url),
             )
-        return max(backoff, parsed_retry_after or 0.0)
+        if parsed_retry_after is not None:
+            return parsed_retry_after
+        base = min(15.0, max(5.0, float(2 ** (attempt - 1))))
+        try:
+            jitter = float(self._jitter(base))
+        except (TypeError, ValueError, OverflowError) as error:
+            raise ConfigurationError("jitter must return a finite number") from error
+        if not (0.0 <= jitter < float("inf")):
+            raise ConfigurationError("jitter must return a finite non-negative number")
+        return min(15.0, base + jitter)
+
+    def _log_get(
+        self,
+        source_kind: str,
+        url: str,
+        params: Mapping[str, Any] | None,
+    ) -> None:
+        if source_kind not in {"wiki", "robots"}:
+            return
+        title = None
+        if params:
+            raw_title = params.get("titles") or params.get("cmtitle")
+            if isinstance(raw_title, str) and raw_title:
+                title = raw_title
+        extra = f" titles={title}" if title else ""
+        self._logger.info("http: %s GET %s%s", source_kind, safe_url(url), extra)
 
     def get(
         self,
@@ -236,23 +426,18 @@ class HttpClient:
         current_params = params
         visited = {_without_fragment(url)}
         accepted = frozenset(accepted_statuses)
+        cookie_retry_allowed = True
 
         with self._request_lock:
             for attempt in range(1, self.config.max_attempts + 1):
                 self.limiter.wait()
-                self._logger.info(
-                    "http: %s GET %s attempt=%d/%d",
-                    source_kind,
-                    _request_label(current_url, current_params),
-                    attempt,
-                    self.config.max_attempts,
-                )
                 response: requests.Response | None = None
                 try:
+                    self._log_get(source_kind, current_url, current_params)
                     response = self.session.get(
                         current_url,
                         params=current_params,
-                        headers={"User-Agent": self.config.user_agent},
+                        headers=self._request_headers(current_url),
                         timeout=self.config.timeout,
                         stream=True,
                         allow_redirects=False,
@@ -262,6 +447,7 @@ class HttpClient:
                     if response is not None:
                         response.close()
                     self.limiter.record_completion()
+                    self._recreate_session()
                     if attempt == self.config.max_attempts:
                         raise NetworkError(
                             current_url,
@@ -296,36 +482,49 @@ class HttpClient:
                     response.close()
                     self.limiter.record_completion()
 
-                status = response.status_code
-                if status in _REDIRECT_STATUSES:
-                    location = response.headers.get("Location")
-                    if not location:
-                        raise RedirectError(current_url, "redirect has no Location header")
-                    target = _without_fragment(urljoin(response.url or current_url, location))
-                    if source_kind == "guide":
-                        target = _without_query_or_fragment(target)
-                    try:
-                        self.config.validate_redirect(source_kind, initial_url, target)
-                    except ConfigurationError as error:
-                        raise RedirectPolicyError(
-                            target,
-                            "redirect leaves its approved source boundary",
-                        ) from error
-                    if target in visited:
-                        raise RedirectError(target, "redirect loop detected")
-                    if attempt == self.config.max_attempts:
-                        raise RedirectError(target, "redirect exceeds the five-attempt budget")
-                    visited.add(target)
-                    current_url = target
-                    current_params = None
-                    continue
+                    status = response.status_code
+                    if status in _REDIRECT_STATUSES:
+                        location = response.headers.get("Location")
+                        if not location:
+                            raise RedirectError(current_url, "redirect has no Location header")
+                        target = _without_fragment(urljoin(response.url or current_url, location))
+                        if source_kind == "guide":
+                            target = _without_query_or_fragment(target)
+                        try:
+                            self.config.validate_redirect(source_kind, initial_url, target)
+                        except ConfigurationError as error:
+                            raise RedirectPolicyError(
+                                target,
+                                "redirect leaves its approved source boundary",
+                            ) from error
+                        if target in visited:
+                            raise RedirectError(target, "redirect loop detected")
+                        if attempt == self.config.max_attempts:
+                            raise RedirectError(target, "redirect exceeds the five-attempt budget")
+                        visited.add(target)
+                        current_url = target
+                        current_params = None
+                        continue
 
-                if 200 <= status <= 299 or status in accepted:
-                    if _unexpected_html_payload(source_kind, response):
+                    if 200 <= status <= 299 or status in accepted:
+                        if 200 <= status <= 299:
+                            try:
+                                return self._accept_success(
+                                    response,
+                                    current_url,
+                                    source_kind,
+                                    allow_cookie_retry=cookie_retry_allowed,
+                                )
+                            except _RetryAfterCookieRefresh:
+                                cookie_retry_allowed = False
+                                continue
+                        return response
+
+                    if status == 429 or 500 <= status <= 599:
                         if attempt == self.config.max_attempts:
                             raise RetryExhaustedError(
                                 current_url,
-                                "source returned an HTML interstitial",
+                                "retryable HTTP response persisted",
                                 attempt,
                                 status,
                             )
@@ -335,45 +534,21 @@ class HttpClient:
                             current_url,
                         )
                         self._logger.warning(
-                            "Retrying %s after HTML interstitial attempt=%d delay=%.3f",
+                            "Retrying %s status=%d attempt=%d delay=%.3f",
                             safe_url(current_url),
+                            status,
                             attempt,
                             delay,
                         )
                         self.retry_count += 1
                         self._sleep(delay)
                         continue
-                    return response
 
-                if status == 429 or 500 <= status <= 599:
-                    if attempt == self.config.max_attempts:
-                        raise RetryExhaustedError(
-                            current_url,
-                            "retryable HTTP response persisted",
-                            attempt,
-                            status,
-                        )
-                    delay = self._retry_delay(
-                        attempt,
-                        response.headers.get("Retry-After"),
+                    raise HttpStatusError(
                         current_url,
-                    )
-                    self._logger.warning(
-                        "Retrying %s status=%d attempt=%d delay=%.3f",
-                        safe_url(current_url),
+                        "non-retryable HTTP response",
                         status,
-                        attempt,
-                        delay,
                     )
-                    self.retry_count += 1
-                    self._sleep(delay)
-                    continue
-
-                raise HttpStatusError(
-                    current_url,
-                    "non-retryable HTTP response",
-                    status,
-                )
 
         raise AssertionError("request attempt loop terminated unexpectedly")
 

@@ -10,16 +10,16 @@ from pathlib import Path
 from urllib.parse import unquote, urljoin, urlsplit
 
 from .errors import ConfigurationError
+from .interstitial import DEFAULT_MAX_CONSECUTIVE_BLOCKS, validate_wiki_cookie
 
 DEFAULT_WIKI_ENDPOINT = "https://wiki.wargaming.net/api.php"
 DEFAULT_GUIDE_ROOT = "https://worldoftanks.com/en/content/guide/"
 DEFAULT_USER_AGENT = "WoTGraphBot/0.1.0 (contact: joe.a.ressler+tankgraph@gmail.com)"
 DEFAULT_GUIDE_PATHS = ("newcomers-guide/getting_started/",)
-TANK_COACH_GUIDE_PATHS = (
-    "tank-coach-video-guides/",
-    "tank-coach-video-guides/tank-coach-research/",
-)
-PRODUCTION_REQUEST_INTERVAL = 5.0
+# Temporary live-extract subset so Rust ingestion can start. Restore
+# Category:Tanks and an empty nation filter for the full production crawl.
+LIVE_ROOT_CATEGORY = "Category:USA Tanks"
+LIVE_NATIONS = ("USA",)
 
 _USER_AGENT_RE = re.compile(
     r"\AWoTGraphBot/(?P<version>[0-9A-Za-z][0-9A-Za-z._-]*) "
@@ -146,13 +146,18 @@ class ExtractorConfig:
     guide_root: str = DEFAULT_GUIDE_ROOT
     root_category: str = "Category:Tanks"
     user_agent: str = DEFAULT_USER_AGENT
-    request_interval: float = PRODUCTION_REQUEST_INTERVAL
+    request_interval: float = 5.0
     connect_timeout: float = 10.0
     read_timeout: float = 30.0
     max_attempts: int = 5
     max_response_bytes: int = 10 * 1024 * 1024
     output_path: Path = Path("data/tanks_data.json")
     guide_paths: tuple[str, ...] = DEFAULT_GUIDE_PATHS
+    wiki_cookie: str | None = None
+    max_consecutive_blocks: int = DEFAULT_MAX_CONSECUTIVE_BLOCKS
+    # 0 disables Playwright; any positive value allows a wait-page recovery only.
+    cookie_refresh_every: int = 5
+    nations: tuple[str, ...] = ()
     test_mode: bool = False
 
     def __post_init__(self) -> None:
@@ -162,11 +167,40 @@ class ExtractorConfig:
 
         if not self.root_category.strip():
             raise ConfigurationError("root category must not be blank")
-        minimum_interval = 0.0 if self.test_mode else PRODUCTION_REQUEST_INTERVAL
+        seen_nations: set[str] = set()
+        normalized_nations: list[str] = []
+        for nation in self.nations:
+            cleaned = nation.strip()
+            if not cleaned:
+                raise ConfigurationError("nation filter entries must not be blank")
+            if cleaned in seen_nations:
+                continue
+            seen_nations.add(cleaned)
+            normalized_nations.append(cleaned)
+        object.__setattr__(self, "nations", tuple(normalized_nations))
+        minimum_interval = 0.0 if self.test_mode else 5.0
         if not _is_finite_number(self.request_interval) or self.request_interval < minimum_interval:
             raise ConfigurationError(
                 f"request interval must be finite and at least {minimum_interval:.1f} seconds"
             )
+        if (
+            isinstance(self.max_consecutive_blocks, bool)
+            or not isinstance(self.max_consecutive_blocks, int)
+            or self.max_consecutive_blocks < 1
+        ):
+            raise ConfigurationError(
+                "maximum consecutive interstitial blocks must be a positive integer"
+            )
+        if (
+            isinstance(self.cookie_refresh_every, bool)
+            or not isinstance(self.cookie_refresh_every, int)
+            or self.cookie_refresh_every < 0
+        ):
+            raise ConfigurationError(
+                "cookie refresh interval must be a non-negative integer"
+            )
+        if self.wiki_cookie:
+            object.__setattr__(self, "wiki_cookie", validate_wiki_cookie(self.wiki_cookie))
         for name, value in (
             ("connect timeout", self.connect_timeout),
             ("read timeout", self.read_timeout),
@@ -250,6 +284,10 @@ class ExtractorConfig:
         ):
             return "guide"
         raise ConfigurationError("request URL is outside configured source endpoints")
+
+    def is_wiki_host(self, url: str) -> bool:
+        """True when the URL is on the configured MediaWiki host."""
+        return _authority(url) == _authority(self.wiki_endpoint)
 
     def validate_redirect(self, original_kind: str, original_url: str, target_url: str) -> None:
         """Enforce host boundaries and the guide-root path on every redirect."""

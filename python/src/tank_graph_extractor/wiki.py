@@ -23,6 +23,7 @@ from mwparserfromhell.nodes import (
 from mwparserfromhell.parser import ParserError
 from mwparserfromhell.wikicode import Wikicode
 
+from .errors import ConfigurationError
 from .models import (
     CandidateStatus,
     DiagnosticSeverity,
@@ -54,12 +55,21 @@ PARAMETER_ALIASES: Mapping[str, tuple[str, ...]] = {
     "nation": ("nation", "country"),
     "tier": ("tier", "level"),
 }
-PERFORMANCE_PARAM_ALIASES = frozenset(
-    {"inthegame performance", "in the game performance", "performance"}
-)
-TACTICS_PARAM_ALIASES = frozenset({"inthegame tactics", "in the game tactics", "tactics"})
 TACTICAL_SECTION_TITLES = frozenset({"performance", "tactics"})
-_TIER_ROMAN = {
+INFOBOX_TACTICAL_ALIASES: Mapping[str, tuple[str, ...]] = {
+    "Performance": ("inthegame performance", "in the game performance"),
+    "Tactics": ("inthegame tactics", "in the game tactics"),
+}
+_VALID_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+_INCOMPLETE_METADATA_CODES = frozenset({"missing_primary_class", "missing_nation", "missing_tier"})
+_MAINTENANCE_CATEGORY = "tank articles requiring maintenance"
+_TABLE_RE = re.compile(r"\{\|.*?\|\}", re.DOTALL)
+_CITATION_RE = re.compile(r"\[(?:\s*\d+\s*|citation needed)\]", re.IGNORECASE)
+_LIST_PREFIX_RE = re.compile(r"^\s*[*#;:]+\s*")
+_SPACE_RE = re.compile(r"[^\S\r\n]+")
+_EMPTY_LINES_RE = re.compile(r"\n{3,}")
+_TIER_CATEGORY_RE = re.compile(r"\Atier (?P<token>[ivxlcdm]+|\d+)(?: tanks?)?\Z")
+_ROMAN_TIERS: Mapping[str, int] = {
     "i": 1,
     "ii": 2,
     "iii": 3,
@@ -71,12 +81,6 @@ _TIER_ROMAN = {
     "ix": 9,
     "x": 10,
 }
-_VALID_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
-_TABLE_RE = re.compile(r"\{\|.*?\|\}", re.DOTALL)
-_CITATION_RE = re.compile(r"\[(?:\s*\d+\s*|citation needed)\]", re.IGNORECASE)
-_LIST_PREFIX_RE = re.compile(r"^\s*[*#;:]+\s*")
-_SPACE_RE = re.compile(r"[^\S\r\n]+")
-_EMPTY_LINES_RE = re.compile(r"\n{3,}")
 
 
 NATION_ALIASES: Mapping[str, str] = {
@@ -133,6 +137,132 @@ def canonicalize_nation(value: str | None) -> str | None:
     return NATION_ALIASES.get(identity_key(value))
 
 
+def nation_from_category(category: str) -> str | None:
+    """Map Category:USA Tanks and similar nation buckets onto a canonical nation."""
+
+    leaf = category_leaf(category)
+    found = canonicalize_nation(leaf)
+    if found is not None:
+        return found
+    for suffix in (" tanks", " tank"):
+        if leaf.endswith(suffix):
+            found = canonicalize_nation(leaf[: -len(suffix)])
+            if found is not None:
+                return found
+    return None
+
+
+def tier_from_category(category: str) -> int | None:
+    """Map Category:Tier I Tanks onto a 1-10 tier."""
+
+    match = _TIER_CATEGORY_RE.fullmatch(category_leaf(category))
+    if match is None:
+        return None
+    token = match.group("token")
+    if token.isdigit():
+        tier = int(token, 10)
+    else:
+        tier = _ROMAN_TIERS.get(token)
+        if tier is None:
+            return None
+    return tier if 1 <= tier <= 10 else None
+
+
+def _wikicode_categories(code: Wikicode) -> tuple[str, ...]:
+    categories: list[str] = []
+    seen: set[str] = set()
+    for link in code.filter_wikilinks():
+        target = normalize_text(str(link.title).replace("_", " "))
+        if not identity_key(target).startswith("category:"):
+            continue
+        key = identity_key(target)
+        if key in seen:
+            continue
+        seen.add(key)
+        categories.append(target)
+    return tuple(categories)
+
+
+def _evidence_categories(
+    page: PageDescriptor,
+    code: Wikicode,
+    revision_categories: Sequence[str] = (),
+) -> tuple[str, ...]:
+    categories: list[str] = []
+    seen: set[str] = set()
+    for category in (*page.categories, *revision_categories, *_wikicode_categories(code)):
+        key = identity_key(category)
+        if key in seen:
+            continue
+        seen.add(key)
+        categories.append(category)
+    return tuple(categories)
+
+
+def resolve_nation_filter(values: Sequence[str]) -> tuple[str, ...]:
+    """Canonicalize CLI nation filters; ``ALL`` disables the temporary subset."""
+
+    if any(identity_key(value) == "all" for value in values):
+        return ()
+    resolved: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        canonical = canonicalize_nation(value)
+        if canonical is None:
+            raise ConfigurationError(f"unknown nation filter: {value}")
+        if canonical in seen:
+            continue
+        seen.add(canonical)
+        resolved.append(canonical)
+    return tuple(resolved)
+
+
+def probe_mediawiki_api(client: WikiHttpClient, endpoint: str) -> None:
+    """Confirm api.php returns JSON, not the JS cookie interstitial HTML."""
+
+    params = {
+        "action": "query",
+        "format": "json",
+        "list": "allpages",
+        "aplimit": "1",
+    }
+    response = client.get(endpoint, params=params, source_kind="wiki")
+    source_url = getattr(response, "url", endpoint)
+    try:
+        payload = response.json()
+    except (TypeError, ValueError) as error:
+        _raise_wiki(
+            "invalid_allpages_json",
+            f"allpages probe is not valid JSON: {error}",
+            "allpages",
+            source_url,
+        )
+    if not isinstance(payload, dict):
+        _raise_wiki(
+            "malformed_allpages_response",
+            "allpages probe root must be an object",
+            "allpages",
+            source_url,
+        )
+    if "error" in payload:
+        error = payload["error"]
+        message = error.get("info") if isinstance(error, dict) else str(error)
+        _raise_wiki(
+            "wiki_api_error",
+            f"MediaWiki allpages probe failed: {message}",
+            "allpages",
+            source_url,
+        )
+    query = payload.get("query")
+    if not isinstance(query, dict) or "allpages" not in query:
+        _raise_wiki(
+            "malformed_allpages_response",
+            "allpages probe is missing query.allpages",
+            "allpages",
+            source_url,
+        )
+
+
 def fetch_wiki_revision(
     client: WikiHttpClient,
     endpoint: str,
@@ -144,8 +274,9 @@ def fetch_wiki_revision(
     params = {
         "action": "query",
         "format": "json",
-        "prop": "revisions|pageprops",
+        "prop": "revisions|pageprops|categories",
         "rvprop": "content",
+        "cllimit": "max",
         "redirects": "1",
         "titles": title,
     }
@@ -257,7 +388,29 @@ def _revision_from_payload(payload: Any, requested_title: str, source_url: str) 
         source_url=source_url,
         display_title=display_title,
         page_id=page_id,
+        categories=_page_categories(page),
     )
+
+
+def _page_categories(page: Mapping[str, Any]) -> tuple[str, ...]:
+    raw = page.get("categories")
+    if not isinstance(raw, list):
+        return ()
+    titles: list[str] = []
+    seen: set[str] = set()
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        title = item.get("title")
+        if not isinstance(title, str) or not title.strip():
+            continue
+        normalized = normalize_text(title.replace("_", " "))
+        key = identity_key(normalized)
+        if key in seen:
+            continue
+        seen.add(key)
+        titles.append(normalized)
+    return tuple(titles)
 
 
 def _revision_text(revision: Mapping[str, Any]) -> str | None:
@@ -330,6 +483,7 @@ class WikiVehicleParser:
         page: PageDescriptor,
         taxonomy: Taxonomy,
     ) -> WikiParseResult:
+        evidence_categories: tuple[str, ...] = ()
         try:
             code = mwparserfromhell.parse(revision.text)
             infoboxes = [
@@ -356,22 +510,20 @@ class WikiVehicleParser:
 
             values = _logical_parameter_values(infoboxes[0], revision.title, revision.source_url)
             diagnostics: list[ExtractionDiagnostic] = []
-            metadata = self._metadata(values, revision, page, taxonomy, diagnostics)
+            evidence_categories = _evidence_categories(page, code, revision.categories)
+            metadata = self._metadata(
+                values, revision, page, taxonomy, diagnostics, evidence_categories
+            )
             sections, section_diagnostics = extract_tactical_sections(
                 code, revision.title, revision.source_url
             )
-            infobox_sections, infobox_diagnostics = _infobox_tactical_sections(
-                infoboxes[0], revision.title, revision.source_url
-            )
-            present = {identity_key(section.title) for section in sections}
-            extra = tuple(
-                section
-                for section in infobox_sections
-                if identity_key(section.title) not in present
-            )
-            sections = (*sections, *extra)
             diagnostics.extend(section_diagnostics)
-            diagnostics.extend(infobox_diagnostics)
+            if not sections:
+                infobox_sections, infobox_diagnostics = _tactical_sections_from_infobox(
+                    infoboxes[0], revision
+                )
+                sections = infobox_sections
+                diagnostics.extend(infobox_diagnostics)
             vehicle = WikiVehicle(
                 page=page,
                 metadata=metadata,
@@ -384,6 +536,15 @@ class WikiVehicleParser:
                 diagnostics=tuple(diagnostics),
             )
         except WikiExtractionError as error:
+            if _is_incomplete_maintenance_page(error.diagnostic.code, evidence_categories):
+                diagnostic = ExtractionDiagnostic.create(
+                    "incomplete_vehicle_page",
+                    "maintenance stub has no canonical vehicle metadata and was excluded",
+                    severity=DiagnosticSeverity.INFO,
+                    page_title=revision.title,
+                    source_url=revision.source_url,
+                )
+                return WikiParseResult(CandidateStatus.NON_VEHICLE, diagnostics=(diagnostic,))
             return WikiParseResult(CandidateStatus.REJECTED, diagnostics=(error.diagnostic,))
         except (ParserError, RecursionError, TypeError, ValueError) as error:
             diagnostic = ExtractionDiagnostic.create(
@@ -401,6 +562,7 @@ class WikiVehicleParser:
         page: PageDescriptor,
         taxonomy: Taxonomy,
         diagnostics: list[ExtractionDiagnostic],
+        evidence_categories: Sequence[str],
     ) -> VehicleMetadata:
         suffix = _tank_title_suffix(revision.title)
         identifier = values["identifier"]
@@ -447,13 +609,109 @@ class WikiVehicleParser:
             display_name = normalize_text(suffix)
 
         primary_class = _resolve_primary_class(
-            values["primary_class"],
-            taxonomy_primary_classes(taxonomy, page),
+            values["primary_class"] or None,
+            (
+                *taxonomy_primary_classes(taxonomy, page),
+                *(
+                    canonical
+                    for category in evidence_categories
+                    if (canonical := canonicalize_primary_class(category)) is not None
+                ),
+            ),
             revision,
             diagnostics,
         )
-        nation = _resolve_nation(values["nation"], page, revision, diagnostics)
-        tier = _resolve_tier(values["tier"], page, revision, diagnostics)
+
+        raw_nation = values["nation"] or None
+        if raw_nation is None:
+            inferred_nations = {
+                nation
+                for category in evidence_categories
+                if (nation := nation_from_category(category)) is not None
+            }
+            if len(inferred_nations) > 1:
+                _raise_wiki(
+                    "contradictory_taxonomy_nations",
+                    "page categories provide more than one canonical nation",
+                    revision.title,
+                    revision.source_url,
+                )
+            if len(inferred_nations) == 1:
+                nation = next(iter(inferred_nations))
+                diagnostics.append(
+                    ExtractionDiagnostic.create(
+                        "infobox_nation_fallback",
+                        "taxonomy evidence supplied the missing infobox nation",
+                        severity=DiagnosticSeverity.WARNING,
+                        page_title=revision.title,
+                        source_url=revision.source_url,
+                    )
+                )
+            else:
+                _raise_wiki(
+                    "missing_nation",
+                    "vehicle infobox has no nation",
+                    revision.title,
+                    revision.source_url,
+                )
+        else:
+            nation = canonicalize_nation(raw_nation)
+            if nation is None:
+                _raise_wiki(
+                    "unknown_nation",
+                    f"vehicle infobox nation is not canonical: {raw_nation}",
+                    revision.title,
+                    revision.source_url,
+                )
+
+        raw_tier = values["tier"] or None
+        if raw_tier is None:
+            inferred_tiers = {
+                tier
+                for category in evidence_categories
+                if (tier := tier_from_category(category)) is not None
+            }
+            if len(inferred_tiers) > 1:
+                _raise_wiki(
+                    "contradictory_taxonomy_tiers",
+                    "page categories provide more than one vehicle tier",
+                    revision.title,
+                    revision.source_url,
+                )
+            if len(inferred_tiers) == 1:
+                tier = next(iter(inferred_tiers))
+                diagnostics.append(
+                    ExtractionDiagnostic.create(
+                        "infobox_tier_fallback",
+                        "taxonomy evidence supplied the missing infobox tier",
+                        severity=DiagnosticSeverity.WARNING,
+                        page_title=revision.title,
+                        source_url=revision.source_url,
+                    )
+                )
+            else:
+                _raise_wiki(
+                    "missing_tier",
+                    "vehicle infobox has no tier",
+                    revision.title,
+                    revision.source_url,
+                )
+        else:
+            if not re.fullmatch(r"[0-9]+", raw_tier):
+                _raise_wiki(
+                    "invalid_tier",
+                    "vehicle tier must be a base-10 integer",
+                    revision.title,
+                    revision.source_url,
+                )
+            tier = int(raw_tier, 10)
+            if not 1 <= tier <= 10:
+                _raise_wiki(
+                    "invalid_tier",
+                    "vehicle tier must be between 1 and 10",
+                    revision.title,
+                    revision.source_url,
+                )
 
         return VehicleMetadata(
             name=name,
@@ -525,198 +783,6 @@ def _resolve_primary_class(
         revision.title,
         revision.source_url,
     )
-
-
-def _parse_infobox_tier(value: str) -> int | None:
-    token = identity_key(value)
-    if not re.fullmatch(r"[0-9]+", token):
-        return None
-    parsed = int(token, 10)
-    if not 1 <= parsed <= 10:
-        return None
-    return parsed
-
-
-def _parse_taxonomy_tier(value: str) -> int | None:
-    token = identity_key(value)
-    parsed = int(token, 10) if re.fullmatch(r"[0-9]+", token) else _TIER_ROMAN.get(token)
-    if parsed is None or not 1 <= parsed <= 10:
-        return None
-    return parsed
-
-
-def _taxonomy_nations(page: PageDescriptor) -> frozenset[str]:
-    evidence: set[str] = set()
-    seen = (*page.categories, *(part for path in page.category_paths for part in path))
-    for category in seen:
-        leaf = category_leaf(category)
-        if leaf.endswith(" tanks"):
-            leaf = leaf[: -len(" tanks")].strip()
-        nation = canonicalize_nation(leaf)
-        if nation is not None:
-            evidence.add(nation)
-    return frozenset(evidence)
-
-
-def _taxonomy_tiers(page: PageDescriptor) -> frozenset[int]:
-    evidence: set[int] = set()
-    seen = (*page.categories, *(part for path in page.category_paths for part in path))
-    for category in seen:
-        leaf = category_leaf(category)
-        match = re.fullmatch(r"tier ([ivx]+|\d+)(?: tanks)?", leaf)
-        if match is None:
-            continue
-        parsed = _parse_taxonomy_tier(match.group(1))
-        if parsed is not None:
-            evidence.add(parsed)
-    return frozenset(evidence)
-
-
-def _resolve_nation(
-    infobox_value: str | None,
-    page: PageDescriptor,
-    revision: WikiRevision,
-    diagnostics: list[ExtractionDiagnostic],
-) -> str:
-    taxonomy_nations = _taxonomy_nations(page)
-    if len(taxonomy_nations) > 1:
-        _raise_wiki(
-            "contradictory_taxonomy_nations",
-            "taxonomy paths provide more than one canonical nation",
-            revision.title,
-            revision.source_url,
-        )
-    infobox_nation = canonicalize_nation(infobox_value) if infobox_value is not None else None
-    if infobox_value is not None and infobox_nation is None:
-        _raise_wiki(
-            "unknown_nation",
-            f"vehicle infobox nation is not canonical: {infobox_value}",
-            revision.title,
-            revision.source_url,
-        )
-    if infobox_nation is not None and len(taxonomy_nations) == 1:
-        taxonomy_nation = next(iter(taxonomy_nations))
-        if infobox_nation == taxonomy_nation:
-            return infobox_nation
-        _raise_wiki(
-            "nation_conflict",
-            "infobox and taxonomy nations disagree",
-            revision.title,
-            revision.source_url,
-        )
-    if infobox_nation is not None:
-        diagnostics.append(
-            ExtractionDiagnostic.create(
-                "missing_taxonomy_nation_evidence",
-                "nation was accepted without taxonomy nation evidence",
-                severity=DiagnosticSeverity.WARNING,
-                page_title=revision.title,
-                source_url=revision.source_url,
-            )
-        )
-        return infobox_nation
-    if len(taxonomy_nations) == 1:
-        diagnostics.append(
-            ExtractionDiagnostic.create(
-                "infobox_nation_fallback",
-                "taxonomy evidence supplied the missing infobox nation",
-                severity=DiagnosticSeverity.WARNING,
-                page_title=revision.title,
-                source_url=revision.source_url,
-            )
-        )
-        return next(iter(taxonomy_nations))
-    _raise_wiki(
-        "missing_nation",
-        "vehicle has no canonical nation evidence",
-        revision.title,
-        revision.source_url,
-    )
-
-
-def _resolve_tier(
-    infobox_value: str | None,
-    page: PageDescriptor,
-    revision: WikiRevision,
-    diagnostics: list[ExtractionDiagnostic],
-) -> int:
-    taxonomy_tiers = _taxonomy_tiers(page)
-    if len(taxonomy_tiers) > 1:
-        _raise_wiki(
-            "contradictory_taxonomy_tiers",
-            "taxonomy paths provide more than one vehicle tier",
-            revision.title,
-            revision.source_url,
-        )
-    infobox_tier = _parse_infobox_tier(infobox_value) if infobox_value is not None else None
-    if infobox_value is not None and infobox_tier is None:
-        _raise_wiki(
-            "invalid_tier",
-            "vehicle infobox tier is not a canonical integer from 1 through 10",
-            revision.title,
-            revision.source_url,
-        )
-    if infobox_tier is not None and len(taxonomy_tiers) == 1:
-        taxonomy_tier = next(iter(taxonomy_tiers))
-        if infobox_tier == taxonomy_tier:
-            return infobox_tier
-        _raise_wiki(
-            "tier_conflict",
-            "infobox and taxonomy tiers disagree",
-            revision.title,
-            revision.source_url,
-        )
-    if infobox_tier is not None:
-        diagnostics.append(
-            ExtractionDiagnostic.create(
-                "missing_taxonomy_tier_evidence",
-                "tier was accepted without taxonomy tier evidence",
-                severity=DiagnosticSeverity.WARNING,
-                page_title=revision.title,
-                source_url=revision.source_url,
-            )
-        )
-        return infobox_tier
-    if len(taxonomy_tiers) == 1:
-        diagnostics.append(
-            ExtractionDiagnostic.create(
-                "infobox_tier_fallback",
-                "taxonomy evidence supplied the missing infobox tier",
-                severity=DiagnosticSeverity.WARNING,
-                page_title=revision.title,
-                source_url=revision.source_url,
-            )
-        )
-        return next(iter(taxonomy_tiers))
-    _raise_wiki(
-        "missing_tier",
-        "vehicle has no canonical tier evidence",
-        revision.title,
-        revision.source_url,
-    )
-
-
-def _infobox_tactical_sections(
-    template: Template, page_title: str, source_url: str
-) -> tuple[tuple[TacticalSection, ...], tuple[ExtractionDiagnostic, ...]]:
-    sections: list[TacticalSection] = []
-    diagnostics: list[ExtractionDiagnostic] = []
-    for heading, aliases in (
-        ("Performance", PERFORMANCE_PARAM_ALIASES),
-        ("Tactics", TACTICS_PARAM_ALIASES),
-    ):
-        raw_values = [
-            str(parameter.value)
-            for parameter in template.params
-            if _normalized_parameter_name(str(parameter.name)) in aliases
-        ]
-        if not raw_values:
-            continue
-        wrapped = f"== {heading} ==\n" + "\n\n".join(raw_values)
-        extracted, extra = extract_tactical_sections(wrapped, page_title, source_url)
-        sections.extend(extracted)
-        diagnostics.extend(extra)
-    return tuple(sections), tuple(diagnostics)
 
 
 def _logical_parameter_values(
@@ -811,6 +877,38 @@ def extract_tactical_sections(
                     severity=DiagnosticSeverity.WARNING,
                     page_title=page_title or None,
                     source_url=source_url or None,
+                )
+            )
+    return tuple(sections), tuple(diagnostics)
+
+
+def _tactical_sections_from_infobox(
+    template: Template, revision: WikiRevision
+) -> tuple[tuple[TacticalSection, ...], tuple[ExtractionDiagnostic, ...]]:
+    """Live TankData stores Performance/Tactics in infobox fields, not headings."""
+
+    parameters: dict[str, list[str]] = {}
+    for parameter in template.params:
+        name = _normalized_parameter_name(str(parameter.name))
+        parameters.setdefault(name, []).append(str(parameter.value))
+
+    sections: list[TacticalSection] = []
+    diagnostics: list[ExtractionDiagnostic] = []
+    for title, aliases in INFOBOX_TACTICAL_ALIASES.items():
+        raw = next((parameters[alias][0] for alias in aliases if parameters.get(alias)), None)
+        if raw is None:
+            continue
+        text = _clean_tactical_body(list(mwparserfromhell.parse(raw).nodes))
+        if text:
+            sections.append(TacticalSection(title=title, text=text, level=2))
+        else:
+            diagnostics.append(
+                ExtractionDiagnostic.create(
+                    "empty_tactical_section",
+                    f"{title} section is empty after markup cleanup",
+                    severity=DiagnosticSeverity.WARNING,
+                    page_title=revision.title,
+                    source_url=revision.source_url,
                 )
             )
     return tuple(sections), tuple(diagnostics)
@@ -922,6 +1020,14 @@ class WikiExtractor:
         except WikiExtractionError as error:
             return WikiParseResult(CandidateStatus.REJECTED, diagnostics=(error.diagnostic,))
         return parse_wiki_vehicle(revision, page, taxonomy)
+
+
+def _is_incomplete_maintenance_page(code: str, categories: Sequence[str]) -> bool:
+    """Broken TankData stubs are category members, not vehicles missing a class."""
+
+    if code not in _INCOMPLETE_METADATA_CODES:
+        return False
+    return any(category_leaf(category) == _MAINTENANCE_CATEGORY for category in categories)
 
 
 def _raise_wiki(code: str, message: str, page_title: str, source_url: str) -> None:

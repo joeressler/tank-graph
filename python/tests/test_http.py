@@ -11,13 +11,16 @@ import requests
 
 from tank_graph_extractor.config import ExtractorConfig
 from tank_graph_extractor.errors import (
+    BotInterstitialError,
     ConfigurationError,
+    ConsecutiveInterstitialError,
     HttpStatusError,
     NetworkError,
     RedirectError,
     RedirectPolicyError,
     ResponseTooLargeError,
     RetryExhaustedError,
+    SecurityInterstitialError,
     safe_url,
 )
 from tank_graph_extractor.http import HttpClient, parse_retry_after
@@ -44,6 +47,7 @@ class ScriptedSession:
         self.events = list(events)
         self.calls: list[dict[str, Any]] = []
         self.closed = False
+        self.cookies = requests.cookies.RequestsCookieJar()
 
     def get(self, url: str, **kwargs: Any) -> requests.Response:
         self.calls.append({"url": url, **kwargs})
@@ -60,10 +64,31 @@ class ScriptedSession:
         self.closed = True
 
 
+WAIT_PAGE_BODY = (
+    b"<!DOCTYPE html><title>Loading site please wait...</title>"
+    b'<div id="loading-content"><div id="JSCookieMSG"></div><div id="sbbhscc"></div></div>'
+)
+JSON_BODY = b'{"ok":true}'
+
+
+HARD_BLOCK_BODY = (
+    b"<html><title>Access</title><p>Sorry, you have been blocked.</p>"
+    b"<p>Incident Reference ID: 660913115756d92883ef0e5dd3eece5a</p></html>"
+)
+
+
+def wait_page_response() -> requests.Response:
+    return response(headers={"Content-Type": "text/html; charset=UTF-8"}, body=WAIT_PAGE_BODY)
+
+
+def hard_block_response() -> requests.Response:
+    return response(headers={"Content-Type": "text/html; charset=UTF-8"}, body=HARD_BLOCK_BODY)
+
+
 def response(
     status: int = 200,
     *,
-    body: bytes = b"ok",
+    body: bytes = JSON_BODY,
     url: str = "https://wiki.wargaming.net/api.php",
     headers: dict[str, str] | None = None,
 ) -> requests.Response:
@@ -90,6 +115,7 @@ def client_for(
     client_config: ExtractorConfig | None = None,
     jitter: Callable[[float], float] = lambda _base: 0.0,
     wall_clock: Callable[[], float] = lambda: 0.0,
+    cookie_refresher: Callable[[], str] | None = None,
 ) -> tuple[HttpClient, ScriptedSession, FakeClock]:
     fake_clock = clock or FakeClock()
     session = ScriptedSession(events)
@@ -100,6 +126,7 @@ def client_for(
         wall_clock=wall_clock,
         sleep=fake_clock.sleep,
         jitter=jitter,
+        cookie_refresher=cookie_refresher,
     )
     return client, session, fake_clock
 
@@ -129,10 +156,30 @@ def test_request_options_are_finite_streamed_and_redirects_are_manual() -> None:
 
     call = session.calls[0]
     assert call["params"] == {"action": "query"}
-    assert call["headers"] == {"User-Agent": config().user_agent}
+    assert call["headers"] == {
+        "User-Agent": config().user_agent,
+        "Connection": "close",
+    }
     assert call["timeout"] == config().timeout
     assert call["stream"] is True
     assert call["allow_redirects"] is False
+
+
+def test_wiki_cookie_is_sent_only_to_the_wiki_host() -> None:
+    cookie = "SPSI=aaa; SPSE=bbb; spcsrf=ccc"
+    client_config = config(wiki_cookie=cookie)
+    guide = response(
+        url=client_config.guide_urls[0],
+        headers={"Content-Type": "text/html"},
+        body=b"<html><title>Guide</title></html>",
+    )
+    client, session, _ = client_for([response(), guide], client_config=client_config)
+
+    client.get(client_config.wiki_endpoint)
+    client.get(client_config.guide_urls[0])
+
+    assert session.calls[0]["headers"]["Cookie"] == cookie
+    assert "Cookie" not in session.calls[1]["headers"]
 
 
 @pytest.mark.parametrize("status", [429, 500, 501, 550, 599])
@@ -144,33 +191,72 @@ def test_every_retryable_status_family_retries(status: int) -> None:
     assert client.retry_count == 1
 
 
-def test_wiki_html_interstitial_is_retried_then_succeeds() -> None:
-    html = response(
-        headers={"Content-Type": "text/html; charset=UTF-8"},
-        body=b"<!DOCTYPE html><title>Loading site please wait...</title>",
-    )
-    client, session, _ = client_for([html, response(body=b'{"ok":true}')])
+def test_javascript_security_gate_fails_without_retry() -> None:
+    client, session, _ = client_for([wait_page_response(), response()])
 
-    result = client.get(config().wiki_endpoint)
-
-    assert result.status_code == 200
-    assert result.content == b'{"ok":true}'
-    assert len(session.calls) == 2
-    assert client.retry_count == 1
-
-
-def test_wiki_html_interstitial_exhausts_retry_budget() -> None:
-    html = response(
-        headers={"Content-Type": "text/html; charset=UTF-8"},
-        body=b"<!DOCTYPE html><title>Loading site please wait...</title>",
-    )
-    client, session, _ = client_for([html] * 5)
-
-    with pytest.raises(RetryExhaustedError, match="HTML interstitial") as caught:
+    with pytest.raises(SecurityInterstitialError, match="interstitial"):
         client.get(config().wiki_endpoint)
 
-    assert caught.value.attempts == 5
-    assert len(session.calls) == 5
+    assert len(session.calls) == 1
+    assert client.retry_count == 0
+    assert client.consecutive_blocks == 1
+
+
+def test_blocked_response_is_not_retried_as_if_the_spinner_would_finish() -> None:
+    client, session, _ = client_for([wait_page_response(), wait_page_response()])
+
+    with pytest.raises(BotInterstitialError):
+        client.get(config().wiki_endpoint)
+    with pytest.raises(BotInterstitialError):
+        client.get(config().wiki_endpoint)
+
+    assert len(session.calls) == 2
+    assert client.retry_count == 0
+    assert client.consecutive_blocks == 2
+
+
+def test_consecutive_interstitials_abort_the_crawl() -> None:
+    client_config = config(max_consecutive_blocks=3)
+    client, session, _ = client_for(
+        [wait_page_response(), wait_page_response(), wait_page_response()],
+        client_config=client_config,
+    )
+
+    with pytest.raises(BotInterstitialError):
+        client.get(client_config.wiki_endpoint)
+    with pytest.raises(BotInterstitialError):
+        client.get(client_config.wiki_endpoint)
+    with pytest.raises(ConsecutiveInterstitialError, match="aborting"):
+        client.get(client_config.wiki_endpoint)
+
+    assert len(session.calls) == 3
+    assert client.retry_count == 0
+
+
+def test_successful_json_resets_consecutive_blocks() -> None:
+    client, _, _ = client_for([wait_page_response(), response(), wait_page_response()])
+
+    with pytest.raises(BotInterstitialError):
+        client.get(config().wiki_endpoint)
+    client.get(config().wiki_endpoint)
+    with pytest.raises(BotInterstitialError):
+        client.get(config().wiki_endpoint)
+
+    assert client.consecutive_blocks == 1
+
+
+def test_unexpected_wiki_html_fails_without_retry() -> None:
+    html = response(
+        headers={"Content-Type": "text/html; charset=UTF-8"},
+        body=b"<!DOCTYPE html><title>Temporary gateway</title>",
+    )
+    client, session, _ = client_for([html, response()])
+
+    with pytest.raises(HttpStatusError, match="unexpected HTML"):
+        client.get(config().wiki_endpoint)
+
+    assert len(session.calls) == 1
+    assert client.retry_count == 0
 
 
 def test_guide_html_is_not_treated_as_interstitial() -> None:
@@ -195,7 +281,7 @@ def test_retry_and_limiter_delays_are_both_satisfied() -> None:
     client.get(config().wiki_endpoint)
 
     assert len(session.calls) == 2
-    assert clock.sleeps == [1.0, 4.0]
+    assert clock.sleeps == [5.0]
     assert clock.value == 5.0
 
 
@@ -292,9 +378,9 @@ def test_invalid_retry_after_is_safely_logged(caplog: pytest.LogCaptureFixture) 
     assert "token=value" not in caplog.text
 
 
-def test_backoff_and_injected_jitter_are_bounded_at_sixty() -> None:
+def test_backoff_and_injected_jitter_are_bounded_at_fifteen() -> None:
     client, _, _ = client_for([], jitter=lambda _base: 1000.0)
-    assert client._retry_delay(10, None, config().wiki_endpoint) == 60.0
+    assert client._retry_delay(10, None, config().wiki_endpoint) == 15.0
 
 
 def test_invalid_injected_jitter_fails_configuration_safely() -> None:
@@ -423,3 +509,334 @@ def test_context_manager_closes_injected_session() -> None:
     with client:
         pass
     assert session.closed is True
+
+
+def test_live_and_test_clients_use_requests_not_playwright() -> None:
+    test_client = HttpClient(config())
+    live_client = HttpClient(ExtractorConfig())
+    assert isinstance(test_client.session, requests.Session)
+    assert isinstance(live_client.session, requests.Session)
+    test_client.close()
+    live_client.close()
+
+
+def test_wiki_cookies_are_loaded_into_the_session_jar() -> None:
+    cookie = "SPSI=aaa; SPSE=bbb; OptanonConsent=skip-me"
+    client_config = config(wiki_cookie=cookie, request_interval=0)
+    client, session, _ = client_for([response()], client_config=client_config)
+
+    client.get(client_config.wiki_endpoint)
+
+    assert session.calls[0]["headers"]["Cookie"] == "SPSI=aaa; SPSE=bbb"
+    assert session.cookies.get("SPSI", domain="wiki.wargaming.net") == "aaa"
+    assert session.cookies.get("SPSE", domain="wiki.wargaming.net") == "bbb"
+    assert session.cookies.get("OptanonConsent", domain="wiki.wargaming.net") is None
+
+
+def test_successful_wiki_requests_do_not_refresh_cookies() -> None:
+    issued: list[str] = []
+
+    def refresher() -> str:
+        issued.append("called")
+        return "SPSI=1; SPSE=1"
+
+    client_config = config(
+        wiki_cookie="SPSI=0; SPSE=0",
+        cookie_refresh_every=5,
+        request_interval=0,
+    )
+    client, session, _ = client_for(
+        [response() for _ in range(6)],
+        client_config=client_config,
+        cookie_refresher=refresher,
+    )
+
+    for _ in range(6):
+        client.get(client_config.wiki_endpoint)
+
+    assert issued == []
+    assert all(call["headers"]["Cookie"] == "SPSI=0; SPSE=0" for call in session.calls)
+    assert client._cookie_broker is None
+
+
+def test_missing_wiki_cookie_does_not_refresh_until_wait_page() -> None:
+    issued: list[str] = []
+
+    def refresher() -> str:
+        issued.append("called")
+        return "SPSI=fresh; SPSE=fresh"
+
+    client_config = config(cookie_refresh_every=5, request_interval=0)
+    client, session, _ = client_for(
+        [response(), wait_page_response(), response()],
+        client_config=client_config,
+        cookie_refresher=refresher,
+    )
+
+    client.get(client_config.wiki_endpoint)
+    assert issued == []
+    assert "Cookie" not in session.calls[0]["headers"]
+
+    assert client.get(client_config.wiki_endpoint).status_code == 200
+    assert issued == ["called"]
+    assert session.calls[1]["headers"].get("Cookie") is None
+    assert session.calls[2]["headers"]["Cookie"] == "SPSI=fresh; SPSE=fresh"
+
+
+def test_guide_requests_do_not_launch_playwright() -> None:
+    issued: list[str] = []
+
+    def refresher() -> str:
+        issued.append("called")
+        return "SPSI=1; SPSE=1"
+
+    client_config = config(
+        wiki_cookie="SPSI=0; SPSE=0",
+        cookie_refresh_every=5,
+        request_interval=0,
+    )
+    guide = response(
+        url=client_config.guide_urls[0],
+        headers={"Content-Type": "text/html"},
+        body=b"<html><title>Guide</title></html>",
+    )
+    events = [response() for _ in range(4)] + [guide, response()]
+    client, session, _ = client_for(
+        events,
+        client_config=client_config,
+        cookie_refresher=refresher,
+    )
+
+    for _ in range(4):
+        client.get(client_config.wiki_endpoint)
+    client.get(client_config.guide_urls[0])
+    client.get(client_config.wiki_endpoint)
+
+    assert issued == []
+    assert all(
+        call["headers"].get("Cookie") == "SPSI=0; SPSE=0"
+        for call in session.calls
+        if call["url"] == client_config.wiki_endpoint
+    )
+
+
+def test_interstitial_retries_once_after_cookie_refresh() -> None:
+    issued: list[str] = []
+
+    def refresher() -> str:
+        issued.append("called")
+        return "SPSI=new; SPSE=new"
+
+    client_config = config(
+        wiki_cookie="SPSI=old; SPSE=old",
+        cookie_refresh_every=5,
+        request_interval=0,
+    )
+    client, session, _ = client_for(
+        [wait_page_response(), response()],
+        client_config=client_config,
+        cookie_refresher=refresher,
+    )
+
+    assert client.get(client_config.wiki_endpoint).status_code == 200
+    assert issued == ["called"]
+    assert [call["headers"]["Cookie"] for call in session.calls] == [
+        "SPSI=old; SPSE=old",
+        "SPSI=new; SPSE=new",
+    ]
+    assert client.consecutive_blocks == 0
+
+
+def test_interstitial_after_cookie_retry_is_not_spun_as_http_retry() -> None:
+    def refresher() -> str:
+        return "SPSI=new; SPSE=new"
+
+    client_config = config(
+        wiki_cookie="SPSI=old; SPSE=old",
+        cookie_refresh_every=5,
+        request_interval=0,
+    )
+    client, session, _ = client_for(
+        [wait_page_response(), wait_page_response()],
+        client_config=client_config,
+        cookie_refresher=refresher,
+    )
+
+    with pytest.raises(BotInterstitialError, match="interstitial"):
+        client.get(client_config.wiki_endpoint)
+
+    assert len(session.calls) == 2
+    assert client.retry_count == 0
+    assert client.consecutive_blocks == 2
+
+
+def test_hard_waf_block_aborts_without_cookie_refresh_or_retry() -> None:
+    issued: list[str] = []
+
+    def refresher() -> str:
+        issued.append("called")
+        return "SPSI=new; SPSE=new"
+
+    client_config = config(
+        wiki_cookie="SPSI=old; SPSE=old",
+        cookie_refresh_every=5,
+        request_interval=0,
+    )
+    client, session, _ = client_for(
+        [hard_block_response(), response()],
+        client_config=client_config,
+        cookie_refresher=refresher,
+    )
+
+    with pytest.raises(ConsecutiveInterstitialError, match="WAF blocked"):
+        client.get(client_config.wiki_endpoint)
+
+    assert issued == []
+    assert len(session.calls) == 1
+    assert client.retry_count == 0
+
+
+def test_test_mode_does_not_refresh_cookies_without_an_injected_refresher() -> None:
+    client_config = config(cookie_refresh_every=5, request_interval=0)
+    client, session, _ = client_for(
+        [response() for _ in range(6)],
+        client_config=client_config,
+    )
+
+    for _ in range(6):
+        client.get(client_config.wiki_endpoint)
+
+    assert all("Cookie" not in call["headers"] for call in session.calls)
+    assert client._cookie_broker is None
+
+
+def test_failed_cookie_refresh_aborts_instead_of_reusing_dead_cookies() -> None:
+    def refresher() -> str:
+        raise BotInterstitialError(
+            "https://wiki.wargaming.net/api.php",
+            "Playwright did not reach MediaWiki JSON or #mw-content-text",
+            1,
+        )
+
+    client_config = config(
+        wiki_cookie="SPSI=keep; SPSE=keep",
+        cookie_refresh_every=5,
+        request_interval=0,
+    )
+    client, session, _ = client_for(
+        [response(), wait_page_response(), response()],
+        client_config=client_config,
+        cookie_refresher=refresher,
+    )
+
+    client.get(client_config.wiki_endpoint)
+    with pytest.raises(ConsecutiveInterstitialError, match="cookie refresh failed"):
+        client.get(client_config.wiki_endpoint)
+
+    assert len(session.calls) == 2
+    assert session.calls[0]["headers"]["Cookie"] == "SPSI=keep; SPSE=keep"
+    assert session.calls[1]["headers"]["Cookie"] == "SPSI=keep; SPSE=keep"
+
+
+def test_disabled_cookie_recovery_does_not_launch_playwright_on_wait_page() -> None:
+    issued: list[str] = []
+
+    def refresher() -> str:
+        issued.append("called")
+        return "SPSI=new; SPSE=new"
+
+    client_config = config(
+        wiki_cookie="SPSI=old; SPSE=old",
+        cookie_refresh_every=0,
+        request_interval=0,
+    )
+    client, session, _ = client_for(
+        [wait_page_response(), response()],
+        client_config=client_config,
+        cookie_refresher=refresher,
+    )
+
+    with pytest.raises(BotInterstitialError, match="interstitial"):
+        client.get(client_config.wiki_endpoint)
+
+    assert issued == []
+    assert len(session.calls) == 1
+
+
+def test_wiki_robots_txt_sends_wiki_host_cookies() -> None:
+    client_config = config(wiki_cookie="SPSI=aaa; SPSE=bbb", request_interval=0)
+    robots = response(
+        url="https://wiki.wargaming.net/robots.txt",
+        headers={"Content-Type": "text/plain"},
+        body=b"User-agent: *\nAllow: /\n",
+    )
+    client, session, _ = client_for([robots], client_config=client_config)
+
+    result = client.get("https://wiki.wargaming.net/robots.txt", allow_robots=True)
+
+    assert result.status_code == 200
+    assert session.calls[0]["headers"]["Cookie"] == "SPSI=aaa; SPSE=bbb"
+
+
+def test_wiki_robots_interstitial_retries_once_after_cookie_refresh() -> None:
+    issued: list[str] = []
+
+    def refresher() -> str:
+        issued.append("called")
+        return "SPSI=new; SPSE=new"
+
+    client_config = config(
+        wiki_cookie="SPSI=old; SPSE=old",
+        cookie_refresh_every=5,
+        request_interval=0,
+    )
+    blocked = wait_page_response()
+    blocked.url = "https://wiki.wargaming.net/robots.txt"
+    robots = response(
+        url="https://wiki.wargaming.net/robots.txt",
+        headers={"Content-Type": "text/plain"},
+        body=b"User-agent: *\nAllow: /\n",
+    )
+    client, session, _ = client_for(
+        [blocked, robots],
+        client_config=client_config,
+        cookie_refresher=refresher,
+    )
+
+    result = client.get("https://wiki.wargaming.net/robots.txt", allow_robots=True)
+
+    assert result.status_code == 200
+    assert "User-agent" in result.text
+    assert issued == ["called"]
+    assert [call["headers"]["Cookie"] for call in session.calls] == [
+        "SPSI=old; SPSE=old",
+        "SPSI=new; SPSE=new",
+    ]
+
+
+def test_guide_host_robots_interstitial_does_not_refresh_wiki_cookies() -> None:
+    issued: list[str] = []
+
+    def refresher() -> str:
+        issued.append("called")
+        return "SPSI=new; SPSE=new"
+
+    client_config = config(
+        wiki_cookie="SPSI=old; SPSE=old",
+        cookie_refresh_every=5,
+        request_interval=0,
+    )
+    blocked = wait_page_response()
+    blocked.url = "https://worldoftanks.com/robots.txt"
+    client, session, _ = client_for(
+        [blocked, response()],
+        client_config=client_config,
+        cookie_refresher=refresher,
+    )
+
+    with pytest.raises(BotInterstitialError, match="interstitial"):
+        client.get("https://worldoftanks.com/robots.txt", allow_robots=True)
+
+    assert issued == []
+    assert len(session.calls) == 1
+    assert "Cookie" not in session.calls[0]["headers"]

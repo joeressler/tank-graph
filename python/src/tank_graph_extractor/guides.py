@@ -19,10 +19,11 @@ from urllib.parse import (
 
 from bs4 import BeautifulSoup, Tag
 
-from .config import DEFAULT_GUIDE_PATHS, DEFAULT_GUIDE_ROOT, TANK_COACH_GUIDE_PATHS
+from .config import DEFAULT_GUIDE_PATHS, DEFAULT_GUIDE_ROOT
+from .interstitial import is_bot_interstitial
 
 GUIDE_ROOT_URL: Final = DEFAULT_GUIDE_ROOT
-INITIAL_GUIDE_ALLOWLIST: Final = frozenset((*DEFAULT_GUIDE_PATHS, *TANK_COACH_GUIDE_PATHS))
+INITIAL_GUIDE_ALLOWLIST: Final = frozenset(DEFAULT_GUIDE_PATHS)
 TANK_COACH_PATH_PREFIX: Final = "/en/content/guide/tank-coach-video-guides/"
 CANONICAL_CLASSES: Final = frozenset(
     {"Light Tanks", "Medium Tanks", "Heavy Tanks", "Tank Destroyers", "SPGs"}
@@ -243,6 +244,8 @@ def discover_allowlisted_children(
 ) -> tuple[str, ...]:
     """Intersect discovered Tank Coach children with prior authorization."""
 
+    if is_bot_interstitial(html):
+        return ()
     page_url = validate_guide_url(page_url, guide_root=guide_root, allowlist=allowlist)
     allowed_urls = {
         validate_guide_url(
@@ -337,6 +340,10 @@ def parse_guide_html(
     """Parse one approved HTML guide without falling back to body text."""
 
     source_url = validate_guide_url(source_url, guide_root=guide_root, allowlist=allowlist)
+    if is_bot_interstitial(html):
+        raise GuideParseError(
+            f"guide response is a JS cookie/anti-bot interstitial: {source_url}"
+        )
     soup = BeautifulSoup(html, "html.parser")
     root = next(
         (

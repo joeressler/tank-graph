@@ -102,3 +102,23 @@ class PolicyFetchError(PolicyError):
 
 class PolicyDisallowedError(PolicyError):
     """A required source is disallowed by robots policy."""
+
+
+@dataclass(eq=False)
+class BotInterstitialError(SourceError):
+    """HTTP 200 returned the JS cookie/anti-bot page, not MediaWiki."""
+
+    consecutive: int = 1
+
+    def __str__(self) -> str:
+        return (
+            f"{self.detail} after {self.consecutive} consecutive blocked response(s) "
+            f"[{self.source}]"
+        )
+
+
+class ConsecutiveInterstitialError(BotInterstitialError):
+    """Too many consecutive interstitial responses; the crawl cannot continue."""
+
+
+SecurityInterstitialError = BotInterstitialError

@@ -19,9 +19,11 @@ def test_defaults_match_milestone_contract() -> None:
     assert config.wiki_endpoint == DEFAULT_WIKI_ENDPOINT
     assert config.guide_root == DEFAULT_GUIDE_ROOT
     assert config.root_category == "Category:Tanks"
+    assert config.nations == ()
     assert config.user_agent == DEFAULT_USER_AGENT
     assert config.contact == "joe.a.ressler+tankgraph@gmail.com"
     assert config.request_interval == 5.0
+    assert config.cookie_refresh_every == 5
     assert config.timeout == (10.0, 30.0)
     assert config.max_attempts == 5
     assert config.output_path == Path("data/tanks_data.json")
@@ -86,6 +88,8 @@ def test_test_mode_allows_http_and_zero_interval() -> None:
         ("max_response_bytes", 0),
         ("max_response_bytes", 1.5),
         ("max_attempts", 4),
+        ("cookie_refresh_every", True),
+        ("cookie_refresh_every", -1),
     ],
 )
 def test_numeric_safety_constraints(field: str, value: object) -> None:
@@ -106,6 +110,11 @@ def test_numeric_safety_constraints(field: str, value: object) -> None:
 def test_guide_paths_cannot_escape_root(guide_path: str) -> None:
     with pytest.raises(ConfigurationError):
         ExtractorConfig(guide_paths=(guide_path,))
+
+
+def test_blank_nation_filter_entries_are_rejected() -> None:
+    with pytest.raises(ConfigurationError, match="nation filter"):
+        ExtractorConfig(nations=("USA", "  "))
 
 
 def test_url_classification_rejects_unapproved_routes_and_credentials() -> None:

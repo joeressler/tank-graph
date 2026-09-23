@@ -5,8 +5,9 @@ Tanks data. Python is responsible for respectful source collection, parsing, and
 NLP enrichment. Rust is responsible for validated ingestion, directed graph
 construction, queries, and benchmarks.
 
-Milestone 1 provides the Python extractor. Later Rust milestones remain
-specifications until they are implemented in order.
+Milestone 1 provides the Python extractor. Milestone 2 provides validated Rust
+ingestion. Milestone 3 builds the directed in-memory graph. Milestone 4
+exposes class and keyword queries plus query-only benchmarks.
 
 ## Canonical specifications
 
@@ -71,13 +72,70 @@ The equivalent installed command is:
 tank-graph-extract extract --contact "joe.a.ressler+tankgraph@gmail.com" --output data/tanks_data.json
 ```
 
+Live collection currently starts at `Category:USA Tanks` and keeps only USA
+vehicles so a smaller schema-valid `data/tanks_data.json` can feed Rust
+ingestion. Restore the full tree with `--root-category Category:Tanks --nation ALL`.
+
 Every production request attempt shares one limiter and starts at least five
 seconds after the previous attempt completed. Collection can therefore take a
-long time. The default official-guide allowlist is the newcomer getting-started
-page; Tank Coach video pages are omitted because they are not prose sources.
-The destination is replaced atomically only after every candidate has been
-processed and the complete root array passes schema and semantic validation.
+long time. The destination is replaced atomically only after every candidate
+has been processed and the complete root array passes schema and semantic
+validation.
+
+Live wiki collection should stay slow and single-client. Use `--request-interval 10`
+(or higher) so each attempt waits longer than the 5.0s floor. Do not run two
+extracts at once, do not retry a 403, and stop if the page says
+"Sorry, you have been blocked." A wait spinner is not a hard block; that
+block page is. Wait until a normal browser can load `#mw-content-text` before
+starting another extract.
+
+Wargaming wikis may return HTTP 200 JS cookie/anti-bot HTML instead of
+MediaWiki. Capture the full Cookie header from the `wiki.wargaming.net` (or
+`wiki.worldoftanks.com`) document request after `#mw-content-text` loads, then
+pass it as `WIKI_COOKIE` or `--wiki-cookie`. Marketing-site `OptanonConsent`
+cookies will not pass the gate. HTTP remains the crawler. Playwright opens
+only when that HTTP response is a wait-page interstitial (or when you pass
+`--bootstrap-wiki-cookies` once at startup). `--cookie-refresh-every 0`
+disables Playwright recovery entirely. Install the optional extra and Chromium
+first:
+
+```powershell
+py -m pip install -e ".\python[playwright]"
+py -m playwright install chromium
+```
+
+`--bootstrap-wiki-cookies` still exports an initial cookie if you want one
+before the first request.
 
 Use `py -m tank_graph_extractor --help` and
 `py -m tank_graph_extractor extract --help` for all configurable endpoints,
 timeouts, limits, and diagnostic options.
+
+## Rust graph engine
+
+Rust 1.86 or newer is required. From `rust/`:
+
+```powershell
+cargo test
+```
+
+Query a dataset. `--data` and `--format` are required:
+
+```powershell
+cargo run -- --data ..\data\tanks_data.json --format text query class --name "Heavy Tanks"
+cargo run -- --data ..\data\tanks_data.json --format json query keyword --name "sidescraping"
+```
+
+Benchmark query-only time after the graph is built. Defaults are 1,000 warm-ups
+and 10,000 measured iterations:
+
+```powershell
+cargo run --release -- --data ..\data\tanks_data.json --format json benchmark class --name "Heavy Tanks" --warmup 1000 --iterations 10000
+```
+
+The controlled p95 gate uses the small fixture, not production data:
+
+```powershell
+cargo test --release --test performance
+```
+
