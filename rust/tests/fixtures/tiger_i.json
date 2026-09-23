@@ -1,0 +1,20 @@
+[
+  {
+    "name": "G04_PzVI_Tiger_I",
+    "display_name": "Tiger I",
+    "class": "Heavy Tanks",
+    "subclasses": [],
+    "nation": "Germany",
+    "tier": 7,
+    "strategies": [
+      "Excels at long-range sniping due to high accuracy.",
+      "Hull armor is flat and easily penetrated; rely on sidescraping configurations."
+    ],
+    "keywords": [
+      "accuracy",
+      "hull armor",
+      "sidescraping",
+      "sniping"
+    ]
+  }
+]

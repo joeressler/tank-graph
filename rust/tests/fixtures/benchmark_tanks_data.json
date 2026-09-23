@@ -1,0 +1,37 @@
+[
+  {
+    "name": "A01_Zebra",
+    "display_name": "Zebra Heavy",
+    "class": "Heavy Tanks",
+    "subclasses": ["Autoloaders"],
+    "nation": "USA",
+    "tier": 8,
+    "strategies": [
+      "Hold the ridge and sidescrape the hull.",
+      "Trade sidescraping against hull-down peekers."
+    ],
+    "keywords": ["hull", "sidescraping"]
+  },
+  {
+    "name": "B01_Alpha",
+    "display_name": "Alpha Heavy",
+    "class": "Heavy Tanks",
+    "subclasses": [],
+    "nation": "Germany",
+    "tier": 7,
+    "strategies": [
+      "Hull armor is flat and easily penetrated; rely on sidescraping configurations."
+    ],
+    "keywords": ["hull armor", "sidescraping"]
+  },
+  {
+    "name": "C01_Medium",
+    "display_name": "Charlie Medium",
+    "class": "Medium Tanks",
+    "subclasses": ["Autoloaders"],
+    "nation": "USA",
+    "tier": 6,
+    "strategies": ["Flank wide and keep moving."],
+    "keywords": ["flanking"]
+  }
+]
