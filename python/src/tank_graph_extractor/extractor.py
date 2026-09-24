@@ -13,8 +13,10 @@ from .config import ExtractorConfig
 from .errors import BotInterstitialError, ConsecutiveInterstitialError, TankGraphError
 from .guides import GuideDiagnostic, GuideParseError, GuideSegment, parse_guide_html
 from .http import HttpClient
+from .identity import identity_key, sort_key
 from .models import (
     CandidateStatus,
+    DiagnosticSeverity,
     ExtractionDiagnostic,
     WikiVehicle,
 )
@@ -203,6 +205,13 @@ def _collect_wiki(
                     diagnostic.message,
                 )
 
+    vehicles, duplicate_rejected, duplicate_diagnostics = _unique_wiki_vehicles(
+        vehicles, logger=logger
+    )
+    rejected += duplicate_rejected
+    diagnostics.extend(duplicate_diagnostics)
+    rejection_diagnostics.extend(duplicate_diagnostics)
+
     if rejected and not vehicles:
         raise ExtractionRunError(
             f"{rejected} vehicle candidate(s) were rejected; output was not published",
@@ -215,6 +224,55 @@ def _collect_wiki(
             len(vehicles),
         )
     return taxonomy, tuple(vehicles), tuple(diagnostics), rejected
+
+
+def _unique_wiki_vehicles(
+    vehicles: list[WikiVehicle],
+    *,
+    logger: logging.Logger,
+) -> tuple[list[WikiVehicle], int, tuple[ExtractionDiagnostic, ...]]:
+    """Keep one accepted vehicle per identity so a wiki collision cannot drop the batch."""
+
+    ordered = sorted(
+        vehicles,
+        key=lambda vehicle: (
+            sort_key(vehicle.metadata.name),
+            sort_key(vehicle.page.title),
+            vehicle.page.page_id if vehicle.page.page_id is not None else -1,
+        ),
+    )
+    kept: list[WikiVehicle] = []
+    seen: dict[str, WikiVehicle] = {}
+    diagnostics: list[ExtractionDiagnostic] = []
+    skipped = 0
+    for vehicle in ordered:
+        key = identity_key(vehicle.metadata.name)
+        previous = seen.get(key)
+        if previous is None:
+            seen[key] = vehicle
+            kept.append(vehicle)
+            continue
+        skipped += 1
+        message = (
+            f"duplicate tank identity {vehicle.metadata.name!r} on {vehicle.page.title!r} "
+            f"conflicts with {previous.metadata.name!r} on {previous.page.title!r}; "
+            "keeping the first in canonical order"
+        )
+        logger.warning("%s", message)
+        diagnostics.append(
+            ExtractionDiagnostic.create(
+                "duplicate_tank_identity",
+                message,
+                severity=DiagnosticSeverity.WARNING,
+                page_title=vehicle.page.title,
+                details={
+                    "kept_page": previous.page.title,
+                    "kept_name": previous.metadata.name,
+                    "dropped_name": vehicle.metadata.name,
+                },
+            )
+        )
+    return kept, skipped, tuple(diagnostics)
 
 
 def run_extraction(

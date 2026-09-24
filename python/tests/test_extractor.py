@@ -232,6 +232,105 @@ def test_rejected_candidate_does_not_discard_accepted_vehicles(tmp_path: Path) -
     assert [record["name"] for record in records] == ["G04_PzVI_Tiger_I"]
 
 
+def test_duplicate_tank_identity_does_not_discard_unique_vehicles(tmp_path: Path) -> None:
+    output = tmp_path / "tanks_data.json"
+    config = ExtractorConfig(
+        wiki_endpoint="https://wiki.test/api.php",
+        guide_root="https://guide.test/en/content/guide/",
+        guide_paths=("newcomers-guide/getting_started/",),
+        output_path=output,
+        test_mode=True,
+        request_interval=0,
+    )
+    summary = run_extraction(
+        config,
+        schema_path=SCHEMA,
+        client=DuplicateIdentityClient(config),  # type: ignore[arg-type]
+        sentence_nlp=Nlp(),
+    )
+
+    records = json.loads(output.read_text(encoding="utf-8"))
+    assert [record["name"] for record in records] == ["M2_Light_Tank"]
+    assert summary.accepted_tank_count == 1
+    assert summary.rejected_candidate_count == 1
+
+
+class DuplicateIdentityClient(FixtureClient):
+    def get(
+        self,
+        url: str,
+        *,
+        params: dict[str, str] | None = None,
+        accepted_statuses: object = (),
+        allow_robots: bool = False,
+        source_kind: str | None = None,
+    ) -> Response:
+        if (
+            params
+            and params.get("list") == "categorymembers"
+            and params["cmtitle"] != "Category:Tanks"
+        ):
+            return Response(
+                url=url,
+                payload={
+                    "query": {
+                        "categorymembers": [
+                            {
+                                "pageid": 11,
+                                "ns": 0,
+                                "type": "page",
+                                "title": "Tank:M2 Light Tank",
+                            },
+                            {
+                                "pageid": 12,
+                                "ns": 0,
+                                "type": "page",
+                                "title": "Tank:M2 Light",
+                            },
+                        ]
+                    }
+                },
+            )
+        title = params.get("titles") if params else None
+        if params and "revisions" in str(params.get("prop", "")) and title in {
+            "Tank:M2 Light Tank",
+            "Tank:M2 Light",
+        }:
+            page_id = "11" if title == "Tank:M2 Light Tank" else "12"
+            return Response(
+                url=url,
+                payload={
+                    "query": {
+                        "pages": {
+                            page_id: {
+                                "pageid": int(page_id),
+                                "title": title,
+                                "pageprops": {"displaytitle": "M2 Light Tank"},
+                                "revisions": [
+                                    {
+                                        "*": (
+                                            "{{Vehicle|id=M2_Light_Tank|"
+                                            "name=M2 Light Tank|class=heavy tank|"
+                                            "nation=germany|tier=2}}\n"
+                                            "== Performance ==\n"
+                                            "Use mobility to stay unspotted."
+                                        )
+                                    }
+                                ],
+                            }
+                        }
+                    }
+                },
+            )
+        return super().get(
+            url,
+            params=params,
+            accepted_statuses=accepted_statuses,
+            allow_robots=allow_robots,
+            source_kind=source_kind,
+        )
+
+
 class PartialRejectClient(FixtureClient):
     def get(
         self,
